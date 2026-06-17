@@ -48,14 +48,15 @@ class NativePTTPlayer: NSObject, URLSessionWebSocketDelegate {
             return
         }
         
-        // ✅ Prevent duplicate pushes from killing the existing connection and losing audio!
+        // ⚠️ Prevent duplicate pushes from killing the existing connection and losing audio!
         if NativePTTPlayer.shared.isReceiving && NativePTTPlayer.shared.webSocketTask != nil {
             print("✅ NativePTTPlayer: Already receiving, ignoring duplicate VoIP push trigger")
             return
         }
         
-        // Disconnect any hanging connection
-        disconnect()
+        // Disconnect any hanging WebSocket WITHOUT resetting the audio session state.
+        // iOS may NOT re-fire sessionDidActivate if the PTT session is already active!
+        softDisconnect()
         isReceiving = true
 
         print("🔊 NativePTTPlayer: Connecting as \(userId) to receive group \(groupId)")
@@ -116,14 +117,37 @@ class NativePTTPlayer: NSObject, URLSessionWebSocketDelegate {
         
         DispatchQueue.main.async {
             self.audioQueue.append(audioData)
-            self.processQueue()
+            // ⚡ If sessionDidActivate already fired (consecutive push), play immediately.
+            // If session isn't active yet, processQueue() will be triggered by sessionDidActivate.
+            self.forceStartIfSessionActive()
         }
     }
 
     // Called from AppDelegate when the system is absolutely ready
     func sessionDidActivate() {
         isAudioSessionActive = true
+        
+        // 🔊 Force the audio to play from the main loud speaker instead of the earpiece!
+        let session = AVAudioSession.sharedInstance()
+        do {
+            // PushToTalk framework activates the session, but we can update the category options
+            // to default to the loud speaker instead of the earpiece.
+            try session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker, .allowBluetooth, .mixWithOthers])
+            print("🔊 NativePTTPlayer: Configured category with defaultToSpeaker")
+        } catch {
+            print("❌ NativePTTPlayer: Failed to configure speaker - \(error)")
+        }
+
         processQueue() // Start playing any queued chunks!
+    }
+
+    // Called when a NEW push arrives and session might ALREADY be active.
+    // Force-start the queue immediately without waiting for sessionDidActivate.
+    func forceStartIfSessionActive() {
+        if isAudioSessionActive {
+            print("⚡ NativePTTPlayer: Session already active — force-starting queue")
+            processQueue()
+        }
     }
 
     private func processQueue() {
@@ -151,9 +175,25 @@ class NativePTTPlayer: NSObject, URLSessionWebSocketDelegate {
         }
     }
 
+    // 🔌 Soft disconnect: closes WebSocket but PRESERVES isAudioSessionActive.
+    // Use this between consecutive pushes when the PTT session may still be active.
+    // iOS will NOT re-fire sessionDidActivate if already active!
+    func softDisconnect() {
+        isReceiving = false
+        isPlaying = false
+        audioQueue.removeAll()
+        audioPlayer?.stop()
+        audioPlayer = nil
+        webSocketTask?.cancel(with: .normalClosure, reason: nil)
+        webSocketTask = nil
+        print("🔌 NativePTTPlayer: Soft-disconnected (audio session state preserved)")
+    }
+
+    // 🔴 Full disconnect: resets ALL state including audio session flag.
+    // Only call this when the PTT session has officially ended (didDeactivate fires).
     func disconnect() {
         isReceiving = false
-        isAudioSessionActive = false // Reset
+        isAudioSessionActive = false // ✅ ONLY reset here (when PTT session truly ends)
         isPlaying = false
         audioQueue.removeAll()
         audioPlayer?.stop()
@@ -167,6 +207,10 @@ class NativePTTPlayer: NSObject, URLSessionWebSocketDelegate {
     func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask,
                     didOpenWithProtocol protocol: String?) {
         print("✅ NativePTTPlayer: WebSocket connected")
+        // ⚡ If the PTT session was already active (consecutive push), kick off the queue now.
+        DispatchQueue.main.async {
+            self.forceStartIfSessionActive()
+        }
     }
 
     func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask,

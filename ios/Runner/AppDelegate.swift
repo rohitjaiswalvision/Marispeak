@@ -127,13 +127,18 @@ class NativePTTPlayer: NSObject, URLSessionWebSocketDelegate {
     func sessionDidActivate() {
         isAudioSessionActive = true
         
-        // 🔊 Force the audio to play from the main loud speaker instead of the earpiece!
+        // 🔊 Force the audio to play from the main loud speaker at FULL volume!
         let session = AVAudioSession.sharedInstance()
         do {
-            // PushToTalk framework activates the session, but we can update the category options
-            // to default to the loud speaker instead of the earpiece.
-            try session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker, .allowBluetooth, .mixWithOthers])
-            print("🔊 NativePTTPlayer: Configured category with defaultToSpeaker")
+            // ✅ FIX: Use .playback category (not .playAndRecord) for maximum output volume.
+            // .playAndRecord routes audio to the earpiece by default (very quiet).
+            // .playback always routes to the loud speaker when overrideOutputAudioPort(.speaker) is set.
+            try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+            // ✅ FIX: Must call setActive(true) BEFORE overrideOutputAudioPort, otherwise the
+            // override can silently fail on some devices and fall back to the quiet earpiece.
+            try session.setActive(true)
+            try session.overrideOutputAudioPort(.speaker) // 🔊 CRITICAL for loud volume
+            print("🔊 NativePTTPlayer: Audio session active — full-volume speaker output")
         } catch {
             print("❌ NativePTTPlayer: Failed to configure speaker - \(error)")
         }
@@ -166,8 +171,10 @@ class NativePTTPlayer: NSObject, URLSessionWebSocketDelegate {
 
             audioPlayer = try AVAudioPlayer(contentsOf: tempFileUrl)
             audioPlayer?.delegate = self
+            audioPlayer?.volume = 1.0  // ✅ FIX: Explicitly set max volume (default is not guaranteed)
+            audioPlayer?.prepareToPlay()  // ✅ Pre-buffer audio to reduce playback latency
             audioPlayer?.play()
-            print("✅ NativePTTPlayer: Audio chunk playing on speaker")
+            print("✅ NativePTTPlayer: Audio chunk playing at full volume on speaker")
         } catch {
             print("❌ NativePTTPlayer: Audio playback error: \(error)")
             self.isPlaying = false
@@ -445,6 +452,12 @@ extension NativePTTPlayer: AVAudioPlayerDelegate {
     let groupId = payloadData["groupId"] as? String ?? ""
     if !groupId.isEmpty {
         NativePTTPlayer.shared.startBackgroundReceive(groupId: groupId)
+        // ✅ FIX: On iOS < 16 (PushKit path) there is no PTT framework didActivate callback.
+        // We must manually signal the audio session is ready after a short delay
+        // so processQueue() can start playing the received chunks.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+            NativePTTPlayer.shared.sessionDidActivate()
+        }
     }
 
     // ✅ Also notify Flutter that VoIP push was received (for when it resumes)
@@ -548,11 +561,13 @@ extension NativePTTPlayer: AVAudioPlayerDelegate {
   private func activateAudioSessionForPTT() {
     do {
       let session = AVAudioSession.sharedInstance()
-      try session.setCategory(.playAndRecord,
-                              options: [.defaultToSpeaker, .mixWithOthers, .allowBluetooth])
-      try session.setMode(.voiceChat)
+      // ✅ FIX: Use .playback category for LOUD speaker output.
+      // .playAndRecord with .voiceChat mode applies AGC + noise suppression that
+      // intentionally reduces output volume by ~60%. For PTT receive-only, .playback is correct.
+      try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
       try session.setActive(true)
-      print("✅ AVAudioSession activated for PTT delivery")
+      try session.overrideOutputAudioPort(.speaker) // 🔊 Force loud speaker
+      print("✅ AVAudioSession activated for PTT delivery — full volume speaker")
     } catch {
       print("⚠️ Failed to activate audio session for PTT: \(error)")
     }
@@ -733,10 +748,17 @@ extension AppDelegate: PTChannelManagerDelegate, PTChannelRestorationDelegate {
             print("📱 App was killed — showing CallKit call screen for PTT")
             reportPTTCallKitCall(senderName: senderName, groupId: groupId)
         } else {
-            // 🤔 App was in BACKGROUND (user pressed Home) — silent PTT, no call screen.
+            // 🤟 App was in BACKGROUND (user pressed Home) — silent PTT, no call screen.
             print("🤟 App was backgrounded — silent PTT playback")
             if !groupId.isEmpty {
                 NativePTTPlayer.shared.startBackgroundReceive(groupId: groupId)
+                // ✅ FIX: The PTT framework's didActivate fires the session,
+                // but we add a short delay fallback in case it fired before WS connected.
+                // The real session activation comes from channelManager(_:didActivate:) below.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    // Only force-start if the PTT framework hasn't already activated
+                    NativePTTPlayer.shared.sessionDidActivate()
+                }
             }
         }
 

@@ -248,6 +248,21 @@ extension NativePTTPlayer: AVAudioPlayerDelegate {
   var activeCallUUID: UUID?
   var channelManager: Any? // PTChannelManager on iOS 16+
 
+  // 🔑 Tracks if the app has ever been in the foreground during this process lifetime.
+  // false = app was just woken from killed state by a VoIP/PTT push
+  // true  = app was backgrounded by user (Home button) — PTT works silently
+  var hasBeenInForeground = false
+
+  // 📻 Once user accepts/declines the first CallKit screen, this stays TRUE
+  // so all subsequent PTT pushes in the same session skip the CallKit UI
+  // and just play audio silently. Resets when the full audio session ends.
+  var isPTTKilledSessionActive = false
+
+  override func applicationDidBecomeActive(_ application: UIApplication) {
+    hasBeenInForeground = true
+    super.applicationDidBecomeActive(application)
+  }
+
   override func application(
     _ application: UIApplication,
     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
@@ -276,11 +291,20 @@ extension NativePTTPlayer: AVAudioPlayerDelegate {
     // ✅ Initialize Push To Talk Framework (iOS 16+)
     if #available(iOS 16.0, *) {
         // ✅ Listen for when the background audio finishes playing
-        NotificationCenter.default.addObserver(forName: NSNotification.Name("PTTAudioFinished"), object: nil, queue: .main) { _ in
+        NotificationCenter.default.addObserver(forName: NSNotification.Name("PTTAudioFinished"), object: nil, queue: .main) { [weak self] _ in
+            guard let self = self else { return }
+            // End PushToTalk remote participant
             if let manager = self.channelManager as? PTChannelManager, let activeUUID = manager.activeChannelUUID {
                 print("🛑 Ending PTT Active Remote Participant")
                 manager.setActiveRemoteParticipant(nil, channelUUID: activeUUID, completionHandler: nil)
             }
+            // End any active CallKit call (shown when app was killed)
+            if let uuid = self.activeCallUUID {
+                self.endPTTCallKitCall(uuid: uuid)
+            }
+            // 🔄 Reset the killed session flag so next fresh kill shows the call screen again
+            self.isPTTKilledSessionActive = false
+            print("🔄 PTT killed session ended — next kill will show call screen again")
         }
 
         PTChannelManager.channelManager(delegate: self, restorationDelegate: self) { manager, error in
@@ -428,6 +452,96 @@ extension NativePTTPlayer: AVAudioPlayerDelegate {
   }
 
   // ─────────────────────────────────────────────────────
+  // MARK: - CallKit for PTT (when app is killed)
+  // ─────────────────────────────────────────────────────
+
+  // Shows a CallKit incoming-call screen — the ONLY reliable way to wake a force-killed app.
+  // Audio plays through NativePTTPlayer immediately; CallKit is auto-ended when audio finishes.
+  private func reportPTTCallKitCall(senderName: String, groupId: String) {
+
+    // 📻 If already in a killed-session (user saw & dismissed the first call screen),
+    // ALL subsequent pushes just play audio silently — no new call screen!
+    if isPTTKilledSessionActive {
+        print("📻 PTT session already active — playing audio silently (no new call screen)")
+        if !groupId.isEmpty {
+            NativePTTPlayer.shared.startBackgroundReceive(groupId: groupId)
+        }
+        return
+    }
+
+    // 🔒 If a CallKit call is still showing (user hasn't acted yet), don't create a second one.
+    if activeCallUUID != nil {
+        print("⚠️ CallKit call already showing — starting audio for new group silently")
+        if !groupId.isEmpty {
+            NativePTTPlayer.shared.startBackgroundReceive(groupId: groupId)
+        }
+        return
+    }
+
+    // ✅ First push in this killed session — show the call screen
+    isPTTKilledSessionActive = true
+    let uuid = UUID()
+    activeCallUUID = uuid
+
+    let config = CXProviderConfiguration(localizedName: "Walkie-Talkie")
+    config.supportsVideo = false
+    config.maximumCallsPerCallGroup = 1
+    config.supportedHandleTypes = [.generic]
+    config.iconTemplateImageData = nil
+    callProvider = CXProvider(configuration: config)
+    callProvider?.setDelegate(self, queue: nil)
+
+    let update = CXCallUpdate()
+    update.remoteHandle = CXHandle(type: .generic, value: senderName)
+    update.hasVideo = false
+    update.localizedCallerName = "📻 \(senderName)"
+    update.supportsHolding = false
+    update.supportsDTMF = false
+    update.supportsGrouping = false
+    update.supportsUngrouping = false
+
+    callProvider?.reportNewIncomingCall(with: uuid, update: update) { [weak self] error in
+      guard let self = self else { return }
+      if let error = error {
+        print("❌ PTT CallKit failed: \(error.localizedDescription)")
+        // Fallback: try NativePTTPlayer anyway
+        if !groupId.isEmpty {
+          NativePTTPlayer.shared.startBackgroundReceive(groupId: groupId)
+          self.activateAudioSessionForPTT()
+          NativePTTPlayer.shared.sessionDidActivate()
+        }
+      } else {
+        print("✅ PTT CallKit call reported — waking killed app for audio!")
+        // Activate audio and start NativePTTPlayer
+        self.activateAudioSessionForPTT()
+        if !groupId.isEmpty {
+          NativePTTPlayer.shared.startBackgroundReceive(groupId: groupId)
+        }
+        // Give NativePTTPlayer 1 second to connect, then force-start if needed
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+          NativePTTPlayer.shared.sessionDidActivate()
+        }
+        // Auto-end after 35s (safety timeout)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 35.0) { [weak self] in
+          guard let self = self, let uuid = self.activeCallUUID else { return }
+          self.endPTTCallKitCall(uuid: uuid)
+        }
+      }
+    }
+  }
+
+  private func endPTTCallKitCall(uuid: UUID) {
+    guard activeCallUUID == uuid else { return } // already ended
+    activeCallUUID = nil
+    let endAction = CXEndCallAction(call: uuid)
+    let transaction = CXTransaction(action: endAction)
+    callController.request(transaction) { error in
+      if let e = error { print("⚠️ PTT CallKit end error: \(e)") }
+      else { print("✅ PTT CallKit call auto-ended after audio finished") }
+    }
+  }
+
+  // ─────────────────────────────────────────────────────
   // MARK: - Audio Session Helpers
   // ─────────────────────────────────────────────────────
 
@@ -564,7 +678,11 @@ extension NativePTTPlayer: AVAudioPlayerDelegate {
 extension AppDelegate: CXProviderDelegate {
   func providerDidReset(_ provider: CXProvider) {}
 
+  // User tapped ANSWER on the Walkie-Talkie call screen
   func provider(_ provider: CXProvider, perform action: CXAnswerCallAction) {
+    print("📞 User answered PTT CallKit call — opening app")
+    // The audio is already playing via NativePTTPlayer.
+    // Notify Flutter so it can open/foreground the app if needed.
     if let controller = window?.rootViewController as? FlutterViewController {
       let channel = FlutterMethodChannel(name: "ptt/voip", binaryMessenger: controller.binaryMessenger)
       channel.invokeMethod("onCallAnswered", arguments: nil)
@@ -572,7 +690,16 @@ extension AppDelegate: CXProviderDelegate {
     action.fulfill()
   }
 
+  // User tapped DECLINE or call timed out.
+  // 💡 IMPORTANT: We do NOT stop audio here! The voice message always plays to completion.
+  // Declining just dismisses the UI — isPTTKilledSessionActive stays true so
+  // future pushes also play silently without showing another call screen.
   func provider(_ provider: CXProvider, perform action: CXEndCallAction) {
+    print("🛑 PTT CallKit call UI dismissed — audio keeps playing silently")
+    activeCallUUID = nil // Clear UUID so auto-end timer won't fire again
+    // ❌ Do NOT call NativePTTPlayer.shared.disconnect() here!
+    // ❌ Do NOT reset isPTTKilledSessionActive here!
+    // Audio will auto-stop when PTTAudioFinished fires, which THEN resets everything.
     if let controller = window?.rootViewController as? FlutterViewController {
       let channel = FlutterMethodChannel(name: "ptt/voip", binaryMessenger: controller.binaryMessenger)
       channel.invokeMethod("onCallEnded", arguments: nil)
@@ -597,18 +724,26 @@ extension AppDelegate: PTChannelManagerDelegate, PTChannelRestorationDelegate {
     func incomingPushResult(channelManager: PTChannelManager, channelUUID: UUID, pushPayload: [String : Any]) -> PTPushResult {
         print("📨 PTT Push Received: \(pushPayload)")
 
-        // ✅ Start native background WebSocket + audio player (works with phone locked)
-        // This plays audio WITHOUT involving Flutter at all
         let groupId = pushPayload["groupId"] as? String ?? ""
-        if !groupId.isEmpty {
-            NativePTTPlayer.shared.startBackgroundReceive(groupId: groupId)
+        let senderName = pushPayload["senderName"] as? String ?? "Walkie-Talkie"
+
+        if !hasBeenInForeground {
+            // 💥 App was FORCE-KILLED and woken by this push.
+            // Use CallKit to get extra background execution time and show the call screen.
+            print("📱 App was killed — showing CallKit call screen for PTT")
+            reportPTTCallKitCall(senderName: senderName, groupId: groupId)
+        } else {
+            // 🤔 App was in BACKGROUND (user pressed Home) — silent PTT, no call screen.
+            print("🤟 App was backgrounded — silent PTT playback")
+            if !groupId.isEmpty {
+                NativePTTPlayer.shared.startBackgroundReceive(groupId: groupId)
+            }
         }
 
-        // ✅ Also notify Flutter (with UserDefaults fallback for when it's ready)
+        // Always notify Flutter (with UserDefaults fallback)
         sendVoIPPushToFlutter(pushPayload)
 
-        let sender = pushPayload["senderName"] as? String ?? "Walkie-Talkie"
-        let participant = PTParticipant(name: sender, image: nil)
+        let participant = PTParticipant(name: senderName, image: nil)
         return .activeRemoteParticipant(participant)
     }
     

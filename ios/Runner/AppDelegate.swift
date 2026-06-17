@@ -61,7 +61,7 @@ class NativePTTPlayer: NSObject, URLSessionWebSocketDelegate {
 
         print("🔊 NativePTTPlayer: Connecting as \(userId) to receive group \(groupId)")
 
-        guard let url = URL(string: "ws://192.168.3.192:3010") else { return } // 🔧 LOCAL TESTING
+        guard let url = URL(string: "wss://ptt.visionvivante.in") else { return } // 🔧 PRODUCTION
         webSocketTask = urlSession.webSocketTask(with: url)
         webSocketTask?.resume()
 

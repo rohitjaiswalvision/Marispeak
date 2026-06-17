@@ -123,7 +123,7 @@ class WebSocketPTTController with WidgetsBindingObserver {
 
     try {
       _channel = WebSocketChannel.connect(
-          Uri.parse("ws://192.168.3.192:3010") // 🔧 LOCAL TESTING
+          Uri.parse("wss://ptt.visionvivante.in") // 🔧 PRODUCTION
           );
 
       _channel!.sink.add(jsonEncode({

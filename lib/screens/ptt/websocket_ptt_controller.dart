@@ -186,6 +186,8 @@ class WebSocketPTTController with WidgetsBindingObserver {
 
     if (data["type"] == "audio") {
       final bytes = base64Decode(data["chunk"]);
+      debugPrint("📦 Flutter received ${bytes.length} bytes of audio");
+      
       final dir = await getApplicationDocumentsDirectory();
       final path =
           "${dir.path}/rx_${DateTime.now().millisecondsSinceEpoch}.aac";
@@ -369,7 +371,15 @@ class WebSocketPTTController with WidgetsBindingObserver {
   // ------------------------------------------------------------
   bool _isHandlingPush = false;
 
-  void handlePushConnect(String id) {
+  void handlePushConnect(String id) async {
+    if (Platform.isIOS) {
+      bool inBackground = await VoIPService().isAppInBackground();
+      if (inBackground) {
+        debugPrint("🟡 Ignoring VoIP push in Flutter because iOS app is in background. Swift handles it!");
+        return;
+      }
+    }
+    
     _isHandlingPush = true;
     connect(id);
     joinGroup(id);
@@ -379,7 +389,7 @@ class WebSocketPTTController with WidgetsBindingObserver {
   }
 
   @override
-  void didChangeAppLifecycleState(AppLifecycleState state) {
+  void didChangeAppLifecycleState(AppLifecycleState state) async {
     if (state == AppLifecycleState.paused ||
         state == AppLifecycleState.inactive ||
         state == AppLifecycleState.detached) {
@@ -396,6 +406,16 @@ class WebSocketPTTController with WidgetsBindingObserver {
     }
 
     if (state == AppLifecycleState.resumed) {
+      if (Platform.isIOS) {
+        // ✅ Check if we are actually in the background (woken by VoIP Push)
+        // If we are, DO NOT connect Flutter's WebSocket! Let Swift handle the audio natively!
+        bool inBackground = await VoIPService().isAppInBackground();
+        if (inBackground) {
+          debugPrint("🟡 App 'resumed' by iOS in background (PushKit) — NOT connecting Flutter WebSocket");
+          return;
+        }
+      }
+
       debugPrint("🟢 App resumed, reconnecting WebSocket");
       if (senderId != null) {
         connect(senderId!);

@@ -56,7 +56,8 @@ async function sendVoIPPush(deviceToken, senderName, groupId) {
   try {
     const result = await apnProvider.send(note, deviceToken);
     if (result.failed.length > 0) {
-      console.warn("⚠️ VoIP push failed:", result.failed[0].response);
+      const failure = result.failed[0];
+      console.warn("⚠️ VoIP push failed:", failure.response || failure.error);
     } else {
       console.log(`📲 VoIP push sent to ${deviceToken.substring(0, 10)}...`);
     }

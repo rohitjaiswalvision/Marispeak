@@ -19,6 +19,12 @@ class NativePTTPlayer: NSObject, URLSessionWebSocketDelegate {
     private override init() { super.init() }
 
     private var webSocketTask: URLSessionWebSocketTask?
+    private var currentDisconnectToken: UUID?
+    private var endTransactionTimer: Timer?
+    
+    // ✅ Must wait for PushToTalk to fully activate before playing!
+    var isAudioSessionActive = false 
+
     private lazy var urlSession: URLSession = {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 30
@@ -41,8 +47,14 @@ class NativePTTPlayer: NSObject, URLSessionWebSocketDelegate {
             print("⚠️ NativePTTPlayer: No userId in UserDefaults — cannot connect")
             return
         }
-
-        // Cancel any previous session
+        
+        // ✅ Prevent duplicate pushes from killing the existing connection and losing audio!
+        if NativePTTPlayer.shared.isReceiving && NativePTTPlayer.shared.webSocketTask != nil {
+            print("✅ NativePTTPlayer: Already receiving, ignoring duplicate VoIP push trigger")
+            return
+        }
+        
+        // Disconnect any hanging connection
         disconnect()
         isReceiving = true
 
@@ -78,6 +90,9 @@ class NativePTTPlayer: NSObject, URLSessionWebSocketDelegate {
             guard let self = self, self.isReceiving else { return }
             switch result {
             case .success(let message):
+                DispatchQueue.main.async {
+                    self.endTransactionTimer?.invalidate() // ✅ Cancel the shutdown, more chunks are arriving!
+                }
                 if case .string(let text) = message {
                     self.handleMessage(text)
                 }
@@ -105,8 +120,14 @@ class NativePTTPlayer: NSObject, URLSessionWebSocketDelegate {
         }
     }
 
+    // Called from AppDelegate when the system is absolutely ready
+    func sessionDidActivate() {
+        isAudioSessionActive = true
+        processQueue() // Start playing any queued chunks!
+    }
+
     private func processQueue() {
-        guard !isPlaying, !audioQueue.isEmpty else { return }
+        guard isAudioSessionActive, !isPlaying, !audioQueue.isEmpty else { return }
         isPlaying = true
         
         let data = audioQueue.removeFirst()
@@ -115,12 +136,6 @@ class NativePTTPlayer: NSObject, URLSessionWebSocketDelegate {
 
     private func playAudio(data: Data) {
         do {
-            // Activate audio session for lockscreen playback
-            let session = AVAudioSession.sharedInstance()
-            try session.setCategory(.playAndRecord, options: [.defaultToSpeaker, .mixWithOthers, .allowBluetooth])
-            try session.setMode(.voiceChat)
-            try session.setActive(true)
-
             let tempDir = FileManager.default.temporaryDirectory
             let tempFileUrl = tempDir.appendingPathComponent(UUID().uuidString + ".m4a")
             try data.write(to: tempFileUrl)
@@ -138,6 +153,7 @@ class NativePTTPlayer: NSObject, URLSessionWebSocketDelegate {
 
     func disconnect() {
         isReceiving = false
+        isAudioSessionActive = false // Reset
         isPlaying = false
         audioQueue.removeAll()
         audioPlayer?.stop()
@@ -163,7 +179,19 @@ class NativePTTPlayer: NSObject, URLSessionWebSocketDelegate {
 extension NativePTTPlayer: AVAudioPlayerDelegate {
     func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
         isPlaying = false
-        processQueue() // Play next chunk if any
+        if audioQueue.isEmpty {
+            // ✅ Wait 3.5 seconds before ending the transaction. 
+            // Because Android streams in 1.5s chunks, we must not close the connection 
+            // between chunks or else the voice will cut off mid-sentence!
+            DispatchQueue.main.async {
+                self.endTransactionTimer?.invalidate()
+                self.endTransactionTimer = Timer.scheduledTimer(withTimeInterval: 3.5, repeats: false) { _ in
+                    NotificationCenter.default.post(name: NSNotification.Name("PTTAudioFinished"), object: nil)
+                }
+            }
+        } else {
+            processQueue() // Play next chunk if any
+        }
     }
 }
 
@@ -203,6 +231,14 @@ extension NativePTTPlayer: AVAudioPlayerDelegate {
 
     // ✅ Initialize Push To Talk Framework (iOS 16+)
     if #available(iOS 16.0, *) {
+        // ✅ Listen for when the background audio finishes playing
+        NotificationCenter.default.addObserver(forName: NSNotification.Name("PTTAudioFinished"), object: nil, queue: .main) { _ in
+            if let manager = self.channelManager as? PTChannelManager, let activeUUID = manager.activeChannelUUID {
+                print("🛑 Ending PTT Active Remote Participant")
+                manager.setActiveRemoteParticipant(nil, channelUUID: activeUUID, completionHandler: nil)
+            }
+        }
+
         PTChannelManager.channelManager(delegate: self, restorationDelegate: self) { manager, error in
             if let error = error {
                 print("❌ Failed to initialize PTChannelManager: \(error)")
@@ -263,6 +299,10 @@ extension NativePTTPlayer: AVAudioPlayerDelegate {
           // ✅ Clear after Flutter has processed it
           UserDefaults.standard.removeObject(forKey: "pending_voip_payload")
           result(nil)
+        } else if call.method == "isAppInBackground" {
+          // ✅ Tell Flutter if the app is truly in the background or not
+          let state = UIApplication.shared.applicationState
+          result(state == .background || state == .inactive)
         } else {
           result(FlutterMethodNotImplemented)
         }
@@ -535,10 +575,12 @@ extension AppDelegate: PTChannelManagerDelegate, PTChannelRestorationDelegate {
         
     func channelManager(_ channelManager: PTChannelManager, didActivate audioSession: AVAudioSession) {
         print("🎙️ PTT Audio Session Activated")
+        NativePTTPlayer.shared.sessionDidActivate()
     }
     
     func channelManager(_ channelManager: PTChannelManager, didDeactivate audioSession: AVAudioSession) {
         print("🎙️ PTT Audio Session Deactivated")
+        NativePTTPlayer.shared.disconnect()
     }
 
     func channelManager(_ channelManager: PTChannelManager, didJoinChannel channelUUID: UUID, reason: PTChannelJoinReason) {

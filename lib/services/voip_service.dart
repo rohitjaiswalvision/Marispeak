@@ -59,6 +59,17 @@ class VoIPService {
     }
   }
 
+  /// Check if the iOS app is truly in the background/inactive
+  Future<bool> isAppInBackground() async {
+    if (!Platform.isIOS) return false;
+    try {
+      final isBackground = await _channel.invokeMethod<bool>('isAppInBackground');
+      return isBackground ?? false;
+    } catch (e) {
+      return false;
+    }
+  }
+
   /// Handles method calls from the iOS native side (AppDelegate)
   Future<dynamic> _handleNativeCall(MethodCall call) async {
     switch (call.method) {

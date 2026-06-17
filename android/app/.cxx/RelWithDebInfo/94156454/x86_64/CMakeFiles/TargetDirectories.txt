@@ -1,0 +1,2 @@
+D:/firechatpro/firechatpro/android/app/.cxx/RelWithDebInfo/94156454/x86_64/CMakeFiles/edit_cache.dir
+D:/firechatpro/firechatpro/android/app/.cxx/RelWithDebInfo/94156454/x86_64/CMakeFiles/rebuild_cache.dir

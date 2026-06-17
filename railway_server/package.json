@@ -1,0 +1,6 @@
+{
+  "dependencies": {
+    "@parse/node-apn": "^7.1.0",
+    "ws": "^8.21.0"
+  }
+}

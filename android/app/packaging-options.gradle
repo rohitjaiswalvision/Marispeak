@@ -1,0 +1,56 @@
+// 
+// Agora SDK App size optimization
+//
+android {
+    packagingOptions {
+				// armeabi-v7a
+				exclude 'lib/armeabi-v7a/libagora_spatial_audio_extension.so'
+				exclude 'lib/armeabi-v7a/libagora_udrm3_extension.so'
+				exclude 'lib/armeabi-v7a/libagora_clear_vision_extension.so'
+				exclude 'lib/armeabi-v7a/libagora_video_encoder_extension.so'
+				exclude 'lib/armeabi-v7a/libagora_audio_beauty_extension.so'
+				exclude 'lib/armeabi-v7a/libagora_video_decoder_extension.so'
+				exclude 'lib/armeabi-v7a/libagora_screen_capture_extension.so'
+				exclude 'lib/armeabi-v7a/libagora_face_detection_extension.so'
+				exclude 'lib/armeabi-v7a/libagora_drm_loader_extension.so'
+				exclude 'lib/armeabi-v7a/libagora_video_quality_analyzer_extension.so'
+				exclude 'lib/armeabi-v7a/libagora_ai_noise_suppression_extension.so'
+				exclude 'lib/armeabi-v7a/libagora_ai_echo_cancellation_extension.so'
+				exclude 'lib/armeabi-v7a/libagora_content_inspect_extension.so'
+				exclude 'lib/armeabi-v7a/libagora_segmentation_extension.so'
+
+				// arm64-v8a
+				exclude 'lib/arm64-v8a/libagora_spatial_audio_extension.so'
+				exclude 'lib/arm64-v8a/libagora_udrm3_extension.so'
+				exclude 'lib/arm64-v8a/libagora_clear_vision_extension.so'
+				exclude 'lib/arm64-v8a/libagora_video_encoder_extension.so'
+				exclude 'lib/arm64-v8a/libagora_audio_beauty_extension.so'
+				exclude 'lib/arm64-v8a/libagora_video_decoder_extension.so'
+				exclude 'lib/arm64-v8a/libagora_screen_capture_extension.so'
+				exclude 'lib/arm64-v8a/libagora_face_detection_extension.so'
+				exclude 'lib/arm64-v8a/libagora_drm_loader_extension.so'
+				exclude 'lib/arm64-v8a/libagora_video_quality_analyzer_extension.so'
+				exclude 'lib/arm64-v8a/libagora_ai_noise_suppression_extension.so'
+				exclude 'lib/arm64-v8a/libagora_ai_echo_cancellation_extension.so'
+				exclude 'lib/arm64-v8a/libagora_content_inspect_extension.so'
+				exclude 'lib/arm64-v8a/libagora_segmentation_extension.so'
+
+				// x86_64
+				exclude 'lib/x86_64/libagora_spatial_audio_extension.so'
+				exclude 'lib/x86_64/libagora_udrm3_extension.so'
+				exclude 'lib/x86_64/libagora_clear_vision_extension.so'
+				exclude 'lib/x86_64/libagora_video_encoder_extension.so'
+				exclude 'lib/x86_64/libagora_audio_beauty_extension.so'
+				exclude 'lib/x86_64/libagora_video_decoder_extension.so'
+				exclude 'lib/x86_64/libagora_screen_capture_extension.so'
+				exclude 'lib/x86_64/libagora_face_detection_extension.so'
+				exclude 'lib/x86_64/libagora_drm_loader_extension.so'
+				exclude 'lib/x86_64/libagora_video_quality_analyzer_extension.so'
+				exclude 'lib/x86_64/libagora_ai_noise_suppression_extension.so'
+				exclude 'lib/x86_64/libagora_ai_echo_cancellation_extension.so'
+				exclude 'lib/x86_64/libagora_content_inspect_extension.so'
+				exclude 'lib/x86_64/libagora_segmentation_extension.so'
+		}
+}
+		
+	

@@ -1,0 +1,2 @@
+D:/marispeak/android/app/.cxx/Debug/5uf12d5s/x86/CMakeFiles/edit_cache.dir
+D:/marispeak/android/app/.cxx/Debug/5uf12d5s/x86/CMakeFiles/rebuild_cache.dir

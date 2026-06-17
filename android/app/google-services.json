@@ -1,0 +1,87 @@
+{
+  "project_info": {
+    "project_number": "282231451432",
+    "firebase_url": "https://ptt-communicator-default-rtdb.firebaseio.com",
+    "project_id": "ptt-communicator",
+    "storage_bucket": "ptt-communicator.appspot.com"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:282231451432:android:6a6650d67127903d056a1d",
+        "android_client_info": {
+          "package_name": "com.pttcommunicate.pttmessenger"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "282231451432-9enjcbps5famouq9f6nvu24k5qshqaio.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.pttcommunicate.pttmessenger",
+            "certificate_hash": "c6b2b3c85956f8e58952e0b988be092ecae77f62"
+          }
+        },
+        {
+          "client_id": "282231451432-h0fmvuvk83s5gr15qbuet6b95qgrbc4q.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.pttcommunicate.pttmessenger",
+            "certificate_hash": "9ad5e5503c7a697d1cd72ece1afa7b25e68fb2d8"
+          }
+        },
+        {
+          "client_id": "282231451432-kv9l1epbpd653nn3th1b0t5qtdmks2ad.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.pttcommunicate.pttmessenger",
+            "certificate_hash": "f2657c832b4ede88b7b59fadfb8e62afee8de7ad"
+          }
+        },
+        {
+          "client_id": "282231451432-sbrtgit19i88eifrfkg9fuhu1d7fpbfj.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.pttcommunicate.pttmessenger",
+            "certificate_hash": "761e8ef82ad1dd33ad7e6aa36b9e5fa8a457ddc2"
+          }
+        },
+        {
+          "client_id": "282231451432-tq80rr91k2p8r2ljiak26e2ko7co1h74.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.pttcommunicate.pttmessenger",
+            "certificate_hash": "aa6eb13cec25999f4c5bb1797640921cbb14f7b5"
+          }
+        },
+        {
+          "client_id": "282231451432-qlthhqcgdqd7rpmsttei5nqg96tat6jc.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyD5MAIAaIhtXwuzWCRWFGi1c1Cdha4rItg"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "282231451432-qlthhqcgdqd7rpmsttei5nqg96tat6jc.apps.googleusercontent.com",
+              "client_type": 3
+            },
+            {
+              "client_id": "282231451432-7kjr2m7l81khpujt7f8kj3bb7pbmek7f.apps.googleusercontent.com",
+              "client_type": 2,
+              "ios_info": {
+                "bundle_id": "com.pttcommunicate.pttmessenger"
+              }
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

@@ -1,0 +1,27 @@
+class Location {
+  final double latitude;
+  final double longitude;
+
+  const Location({this.latitude = 0.1, this.longitude = 0.1});
+
+  @override
+  String toString() {
+    return "Location(latitude: $latitude, longitude: $longitude)";
+  }
+
+  factory Location.fromMap(Map<String, dynamic> data) {
+    final lat = data['latitude'];
+    final long = data['longitude'];
+    return Location(
+      latitude: lat != null ? double.parse('$lat') : 0,
+      longitude: long != null ? double.parse('$long') : 0,
+    );
+  }
+
+  Map<String, dynamic> toMap() {
+    return {
+      'latitude': latitude,
+      'longitude': longitude,
+    };
+  }
+}

@@ -1,0 +1,2 @@
+D:/Marispeak new/marispeak/android/app/.cxx/RelWithDebInfo/1f191vd5/armeabi-v7a/CMakeFiles/edit_cache.dir
+D:/Marispeak new/marispeak/android/app/.cxx/RelWithDebInfo/1f191vd5/armeabi-v7a/CMakeFiles/rebuild_cache.dir

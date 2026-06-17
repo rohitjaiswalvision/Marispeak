@@ -393,6 +393,11 @@ class WebSocketPTTController with WidgetsBindingObserver {
     if (state == AppLifecycleState.paused ||
         state == AppLifecycleState.inactive ||
         state == AppLifecycleState.detached) {
+      if (isRecording) {
+        debugPrint("🛑 App backgrounded while recording! Stopping record timer.");
+        await stopRecording();
+      }
+
       if (_isHandlingPush) {
         debugPrint(
             "🟡 App backgrounded, but ignoring WebSocket close because handling PTT push");

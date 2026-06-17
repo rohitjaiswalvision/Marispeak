@@ -137,8 +137,6 @@ Future<void> main() async {
 
   VoIPService().onVoIPPushReceived = (payload) {
     print('[VoIP] Push Received: $payload');
-    // ✅ AUTO-ANSWER HACK: We are skipping the CallKit answer screen.
-    // So as soon as we receive the push, instantly connect the WebSocket in the background!
     final groupId = payload['groupId'];
     if (groupId != null && groupId.isNotEmpty) {
       WebSocketPTTController().handlePushConnect(groupId);
@@ -152,6 +150,10 @@ Future<void> main() async {
   VoIPService().onCallEnded = () {
     print('[VoIP] Call Ended on iOS lockscreen');
   };
+
+  // ✅ Check for any VoIP push payload stored while app was locked/suspended
+  // This catches the case where iOS woke the app but Flutter wasn't ready yet
+  WidgetsBinding.instance.addObserver(_VoIPResumeObserver());
 
   Get.put(PreferencesController(), permanent: true);
 
@@ -170,6 +172,18 @@ Future<void> main() async {
     ],
     child: const MyApp(),
   ));
+}
+
+/// ✅ Checks for any VoIP push payload stored in UserDefaults while app was locked.
+/// Called every time the app resumes from background.
+class _VoIPResumeObserver extends WidgetsBindingObserver {
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      debugPrint('[VoIP] App resumed — checking for pending push payload...');
+      VoIPService().checkPendingVoIPPayload();
+    }
+  }
 }
 
 class MyApp extends GetView<PreferencesController> {

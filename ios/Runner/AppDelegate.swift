@@ -6,6 +6,166 @@ import AVFoundation
 import PushKit
 import CallKit
 import PushToTalk
+import Foundation
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MARK: - NativePTTPlayer
+// Pure-Swift background WebSocket + audio player.
+// Runs entirely without Flutter — works when phone is locked/app suspended.
+// ─────────────────────────────────────────────────────────────────────────────
+class NativePTTPlayer: NSObject, URLSessionWebSocketDelegate {
+
+    static let shared = NativePTTPlayer()
+    private override init() { super.init() }
+
+    private var webSocketTask: URLSessionWebSocketTask?
+    private lazy var urlSession: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 30
+        return URLSession(configuration: config, delegate: self, delegateQueue: nil)
+    }()
+
+    private var audioPlayer: AVAudioPlayer?
+    private var isReceiving = false
+    private var disconnectTimer: Timer?
+    
+    // ✅ Queue for audio chunks so they don't overlap
+    private var audioQueue: [Data] = []
+    private var isPlaying = false
+
+    // ✅ Called when a VoIP push arrives — connect and play in background
+    func startBackgroundReceive(groupId: String) {
+        // Read current userId that Flutter saved in SharedPreferences (UserDefaults key: flutter.ptt_user_id)
+        let userId = UserDefaults.standard.string(forKey: "flutter.ptt_user_id") ?? ""
+        guard !userId.isEmpty else {
+            print("⚠️ NativePTTPlayer: No userId in UserDefaults — cannot connect")
+            return
+        }
+
+        // Cancel any previous session
+        disconnect()
+        isReceiving = true
+
+        print("🔊 NativePTTPlayer: Connecting as \(userId) to receive group \(groupId)")
+
+        guard let url = URL(string: "ws://192.168.3.192:3010") else { return } // 🔧 LOCAL TESTING
+        webSocketTask = urlSession.webSocketTask(with: url)
+        webSocketTask?.resume()
+
+        // Register
+        sendMessage(["type": "register", "userId": userId])
+        // Join the target group (the groupId from the push payload = sender's channel)
+        sendMessage(["type": "switch", "newGroupId": groupId])
+
+        // Start receiving audio chunks
+        receiveNextMessage()
+
+        // Auto-disconnect after 45s (saves battery, PTT messages are short)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 45) { [weak self] in
+            self?.disconnect()
+        }
+    }
+
+    private func sendMessage(_ dict: [String: String]) {
+        guard let data = try? JSONSerialization.data(withJSONObject: dict),
+              let str = String(data: data, encoding: .utf8) else { return }
+        webSocketTask?.send(.string(str)) { _ in }
+    }
+
+    private func receiveNextMessage() {
+        guard isReceiving else { return }
+        webSocketTask?.receive { [weak self] result in
+            guard let self = self, self.isReceiving else { return }
+            switch result {
+            case .success(let message):
+                if case .string(let text) = message {
+                    self.handleMessage(text)
+                }
+                self.receiveNextMessage() // ✅ Keep listening for more chunks
+            case .failure(let error):
+                print("⚠️ NativePTTPlayer receive error: \(error.localizedDescription)")
+                self.isReceiving = false
+            }
+        }
+    }
+
+    private func handleMessage(_ text: String) {
+        guard let data = text.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let type = json["type"] as? String,
+              type == "audio",
+              let chunk = json["chunk"] as? String,
+              let audioData = Data(base64Encoded: chunk) else { return }
+
+        print("🔊 NativePTTPlayer: Received \(audioData.count) bytes of audio")
+        
+        DispatchQueue.main.async {
+            self.audioQueue.append(audioData)
+            self.processQueue()
+        }
+    }
+
+    private func processQueue() {
+        guard !isPlaying, !audioQueue.isEmpty else { return }
+        isPlaying = true
+        
+        let data = audioQueue.removeFirst()
+        playAudio(data: data)
+    }
+
+    private func playAudio(data: Data) {
+        do {
+            // Activate audio session for lockscreen playback
+            let session = AVAudioSession.sharedInstance()
+            try session.setCategory(.playAndRecord, options: [.defaultToSpeaker, .mixWithOthers, .allowBluetooth])
+            try session.setMode(.voiceChat)
+            try session.setActive(true)
+
+            let tempDir = FileManager.default.temporaryDirectory
+            let tempFileUrl = tempDir.appendingPathComponent(UUID().uuidString + ".m4a")
+            try data.write(to: tempFileUrl)
+
+            audioPlayer = try AVAudioPlayer(contentsOf: tempFileUrl)
+            audioPlayer?.delegate = self
+            audioPlayer?.play()
+            print("✅ NativePTTPlayer: Audio chunk playing on speaker")
+        } catch {
+            print("❌ NativePTTPlayer: Audio playback error: \(error)")
+            self.isPlaying = false
+            self.processQueue() // skip to next
+        }
+    }
+
+    func disconnect() {
+        isReceiving = false
+        isPlaying = false
+        audioQueue.removeAll()
+        audioPlayer?.stop()
+        audioPlayer = nil
+        webSocketTask?.cancel(with: .normalClosure, reason: nil)
+        webSocketTask = nil
+        print("🔌 NativePTTPlayer: Disconnected")
+    }
+
+    // URLSessionWebSocketDelegate
+    func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask,
+                    didOpenWithProtocol protocol: String?) {
+        print("✅ NativePTTPlayer: WebSocket connected")
+    }
+
+    func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask,
+                    didCloseWith closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
+        print("🔌 NativePTTPlayer: WebSocket closed")
+        isReceiving = false
+    }
+}
+
+extension NativePTTPlayer: AVAudioPlayerDelegate {
+    func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
+        isPlaying = false
+        processQueue() // Play next chunk if any
+    }
+}
 
 @main
 @objc class AppDelegate: FlutterAppDelegate, PKPushRegistryDelegate {
@@ -95,6 +255,14 @@ import PushToTalk
       voipChannel.setMethodCallHandler { (call: FlutterMethodCall, result: @escaping FlutterResult) in
         if call.method == "getVoIPToken" {
           result(UserDefaults.standard.string(forKey: "voip_token"))
+        } else if call.method == "getPendingVoIPPayload" {
+          // ✅ Flutter reads this on resume to catch push received while locked
+          let payload = UserDefaults.standard.dictionary(forKey: "pending_voip_payload")
+          result(payload)
+        } else if call.method == "clearPendingVoIPPayload" {
+          // ✅ Clear after Flutter has processed it
+          UserDefaults.standard.removeObject(forKey: "pending_voip_payload")
+          result(nil)
         } else {
           result(FlutterMethodNotImplemented)
         }
@@ -143,9 +311,9 @@ import PushToTalk
       } else {
         print("✅ CallKit call reported")
         
-        // 🚨 QUICK HACK: Instantly "hang up" the CallKit call after 0.5 seconds 
-        // so it doesn't keep ringing like a phone call.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+        // 🚨 QUICK HACK: Instantly "hang up" the CallKit call after 10 seconds 
+        // This gives us enough background execution time to download and play the chunk!
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10.0) {
             let endCallAction = CXEndCallAction(call: uuid)
             let transaction = CXTransaction(action: endCallAction)
             self.callController.request(transaction, completion: { error in
@@ -163,8 +331,15 @@ import PushToTalk
     // ✅ Activate audio session to play received PTT audio
     activateAudioSessionForPTT()
 
-    // ✅ Notify Flutter that VoIP push was received
+    // ✅ Start native background WebSocket + audio player (works with phone locked)
+    // This plays audio WITHOUT involving Flutter at all
     let payloadData = payload.dictionaryPayload
+    let groupId = payloadData["groupId"] as? String ?? ""
+    if !groupId.isEmpty {
+        NativePTTPlayer.shared.startBackgroundReceive(groupId: groupId)
+    }
+
+    // ✅ Also notify Flutter that VoIP push was received (for when it resumes)
     sendVoIPPushToFlutter(payloadData)
   }
 
@@ -236,16 +411,40 @@ import PushToTalk
   }
 
   private func sendVoIPPushToFlutter(_ payload: [AnyHashable: Any]) {
-    guard let controller = window?.rootViewController as? FlutterViewController else { return }
-    let channel = FlutterMethodChannel(name: "ptt/voip", binaryMessenger: controller.binaryMessenger)
-    // Convert payload to String:Any for Flutter
-    let stringPayload = payload.reduce(into: [String: String]()) { result, pair in
-      if let key = pair.key as? String {
-        result[key] = "\(pair.value)"
+    // ✅ ALWAYS persist payload to UserDefaults FIRST
+    // This ensures Flutter can read it even if the engine isn't ready yet
+    var stringPayload: [String: String] = [:]
+    for (key, value) in payload {
+      if let k = key as? String {
+        stringPayload[k] = "\(value)"
       }
     }
+    UserDefaults.standard.set(stringPayload, forKey: "pending_voip_payload")
+    UserDefaults.standard.synchronize()
+    print("📦 VoIP payload persisted to UserDefaults: \(stringPayload)")
+
+    // ✅ Try to deliver to Flutter immediately (works when app is foreground/active)
+    _deliverVoIPPayloadToFlutter(stringPayload, retries: 5)
+  }
+
+  private func _deliverVoIPPayloadToFlutter(_ payload: [String: String], retries: Int) {
+    guard let controller = window?.rootViewController as? FlutterViewController else {
+      // Flutter engine not ready yet — retry after a short delay
+      if retries > 0 {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+          self._deliverVoIPPayloadToFlutter(payload, retries: retries - 1)
+        }
+      } else {
+        print("⚠️ Flutter not ready after retries — payload stored in UserDefaults for resume")
+      }
+      return
+    }
+    let channel = FlutterMethodChannel(name: "ptt/voip", binaryMessenger: controller.binaryMessenger)
     DispatchQueue.main.async {
-        channel.invokeMethod("onVoIPPush", arguments: stringPayload)
+      channel.invokeMethod("onVoIPPush", arguments: payload)
+      print("✅ VoIP payload delivered to Flutter")
+      // Clear persisted payload once successfully delivered
+      UserDefaults.standard.removeObject(forKey: "pending_voip_payload")
     }
   }
 
@@ -313,10 +512,17 @@ extension AppDelegate: PTChannelManagerDelegate, PTChannelRestorationDelegate {
     
     func incomingPushResult(channelManager: PTChannelManager, channelUUID: UUID, pushPayload: [String : Any]) -> PTPushResult {
         print("📨 PTT Push Received: \(pushPayload)")
-        
-        // Notify Flutter
+
+        // ✅ Start native background WebSocket + audio player (works with phone locked)
+        // This plays audio WITHOUT involving Flutter at all
+        let groupId = pushPayload["groupId"] as? String ?? ""
+        if !groupId.isEmpty {
+            NativePTTPlayer.shared.startBackgroundReceive(groupId: groupId)
+        }
+
+        // ✅ Also notify Flutter (with UserDefaults fallback for when it's ready)
         sendVoIPPushToFlutter(pushPayload)
-        
+
         let sender = pushPayload["senderName"] as? String ?? "Walkie-Talkie"
         let participant = PTParticipant(name: sender, image: nil)
         return .activeRemoteParticipant(participant)

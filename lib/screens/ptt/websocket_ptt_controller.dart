@@ -15,6 +15,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:audio_session/audio_session.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 class WebSocketPTTController with WidgetsBindingObserver {
   static final WebSocketPTTController _instance =
@@ -113,9 +114,16 @@ class WebSocketPTTController with WidgetsBindingObserver {
     senderId = uid.trim();
     groupId = uid.trim();
 
+    // ✅ Persist userId to UserDefaults (via SharedPreferences) so native Swift
+    // can read it when the app is locked and connect WebSocket natively
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString('ptt_user_id', senderId!);
+    } catch (_) {}
+
     try {
       _channel = WebSocketChannel.connect(
-          Uri.parse("wss://ptt.visionvivante.in")
+          Uri.parse("ws://192.168.3.192:3010") // 🔧 LOCAL TESTING
           );
 
       _channel!.sink.add(jsonEncode({

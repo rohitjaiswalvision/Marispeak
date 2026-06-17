@@ -1,38 +1,44 @@
-const WebSocket = require("ws");
+import apn from "@parse/node-apn";
+import path from "path";
+import { fileURLToPath } from 'url';
 
-const ws = new WebSocket("ws://127.0.0.1:8080");
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
-ws.on("open", () => {
-  console.log("Connected to local PTT server");
-  
-  // Register as a fake user
-  ws.send(JSON.stringify({
-    type: "register",
-    userId: "FakeUser123"
-  }));
+async function testPush() {
+  const options = {
+    token: {
+      key: path.join(__dirname, "AuthKey_AC7HTJC42H.p8"),
+      keyId: "AC7HTJC42H",
+      teamId: "R7VBW74U4H",
+    },
+    production: false, // Testing in Sandbox
+  };
 
-  // Join the same group as the iPhone
-  ws.send(JSON.stringify({
-    type: "switch",
-    newGroupId: "ajaw9LhcwUSp5tyoVXorVYV8N473"
-  }));
+  const apnProvider = new apn.Provider(options);
 
-  // Wait 1 second and send a fake audio message to trigger the VoIP Push
-  setTimeout(() => {
-    console.log("Sending fake audio message to trigger PushToTalk...");
-    ws.send(JSON.stringify({
-      type: "audio",
-      groupId: "ajaw9LhcwUSp5tyoVXorVYV8N473",
-      sender: "FakeUser123",
-      chunk: Buffer.from("fake_audio_data").toString("base64")
-    }));
-    
-    // Close after sending
-    setTimeout(() => {
-      ws.close();
-      console.log("Done!");
-    }, 1000);
-  }, 1000);
-});
+  const deviceToken = "787df0edc2492f192e72ddea2162576b9cae78909738d8a3c9b0089e35f292aa"; // From user's log
 
-ws.on("error", (err) => console.error(err));
+  const note = new apn.Notification();
+  note.expiry = 0; 
+  note.priority = 10;
+  note.payload = {
+    type: "ptt",
+    senderName: "Agent Test",
+    groupId: "ajaw9LhcwUSp5tyoVXorVYV8N473",
+  };
+  note.topic = "com.pttcommunicate.pttmessenger.voip-ptt";
+  note.pushType = "pushtotalk"; 
+
+  console.log("Sending PushToTalk push to:", deviceToken);
+
+  try {
+    const result = await apnProvider.send(note, deviceToken);
+    console.log("Result:", JSON.stringify(result, null, 2));
+  } catch (e) {
+    console.error("Error:", e);
+  }
+  process.exit(0);
+}
+
+testPush();

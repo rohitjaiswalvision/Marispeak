@@ -24,11 +24,11 @@ function initAPNs() {
   try {
     const options = {
       token: {
-        key: path.join(__dirname, "AuthKey_AC7HTJC42H.p8"), // ✅ Absolute path — works from any directory
-        keyId: "AC7HTJC42H",            // <-- Your 10-char Key ID
-        teamId: "R7VBW74U4H",           // <-- Your Apple Team ID (Thalas Apps Pty Ltd)
+        key: path.join(__dirname, "AuthKey_AC7HTJC42H.p8"), // Must match the filename exactly
+        keyId: "AC7HTJC42H",            // ✅ Corrected Key ID (must match the .p8 file)
+        teamId: "R7VBW74U4H",           // <-- Your Apple Team ID
       },
-      production: false, // Set to false for Xcode local testing, change to true for TestFlight/App Store
+      production: false, // ✅ MUST be false while testing in Xcode! (Sandbox tokens will fail in production)
     };
 
     apnProvider = new apn.Provider(options);
@@ -42,7 +42,8 @@ async function sendVoIPPush(deviceToken, senderName, groupId) {
   if (!apnProvider || !deviceToken) return;
 
   const note = new apn.Notification();
-  note.expiry = Math.floor(Date.now() / 1000) + 3600; // expires in 1 hour
+  note.expiry = 0; // Deliver immediately or drop
+  note.priority = 10; // REQUIRED for Apple Push To Talk
   note.payload = {
     type: "ptt",
     senderName: senderName || "PTT Message",

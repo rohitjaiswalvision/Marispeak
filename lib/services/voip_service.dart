@@ -39,6 +39,26 @@ class VoIPService {
     }
   }
 
+  /// ✅ Call this on every app resume to handle pushes received while locked/killed.
+  /// Native side stores payload in UserDefaults when Flutter isn't ready.
+  Future<void> checkPendingVoIPPayload() async {
+    if (!Platform.isIOS) return;
+    try {
+      final raw = await _channel.invokeMethod<Map>('getPendingVoIPPayload');
+      if (raw != null && raw.isNotEmpty) {
+        final payload = Map<String, String>.from(
+          raw.map((k, v) => MapEntry(k.toString(), v.toString())),
+        );
+        debugPrint('📦 Pending VoIP payload found on resume: $payload');
+        onVoIPPushReceived?.call(payload);
+        // Clear it from native side
+        await _channel.invokeMethod('clearPendingVoIPPayload');
+      }
+    } catch (e) {
+      debugPrint('⚠️ checkPendingVoIPPayload error: $e');
+    }
+  }
+
   /// Handles method calls from the iOS native side (AppDelegate)
   Future<dynamic> _handleNativeCall(MethodCall call) async {
     switch (call.method) {

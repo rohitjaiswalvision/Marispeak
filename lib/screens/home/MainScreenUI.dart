@@ -130,6 +130,20 @@ class _MainScreenState extends State<MainScreenUI> with WidgetsBindingObserver {
   StreamSubscription<CompassEvent>? _compassSub;
   Timer? _locationListenerTimer;
   Timer? _initialTimer;
+
+  // ✅ Track Firestore listener for clean disposal (prevents 1-hour memory leak)
+  StreamSubscription? _userLocationsSubscription;
+
+  // ✅ Navigation: turn-by-turn state
+  List<String> _navSteps = [];
+  int _currentStep = 0;
+  bool _isNavigating = false;
+  String _currentInstruction = '';
+
+  // ✅ Map layer toggles
+  bool _showNoaaCharts = false;    // NOAA nautical charts
+  bool _showSatellite = false;     // Esri Ocean satellite
+  bool _showTrafficLayer = true;   // Maritime traffic separation zones
   Timer? _timer_plotter;
   late Timer _timerx;
   bool isOfflineScreenShown = false;
@@ -304,15 +318,77 @@ void startTrip() async {
   void _updateMapLayers() {
     setState(() {
       _staticMapLayers = [
-        TileLayer(urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png', userAgentPackageName: 'com.pttcommunicate.pttmessenger',),
-        TileLayer(urlTemplate: 'https://tiles.openseamap.org/seamark/{z}/{x}/{y}.png', userAgentPackageName: 'com.pttcommunicate.pttmessenger',),
+        // ─── Base layer ─────────────────────────────────────────────
+        if (_showSatellite)
+          // ✅ Esri Ocean basemap — detailed satellite imagery for sea
+          TileLayer(
+            urlTemplate:
+                'https://server.arcgisonline.com/ArcGIS/rest/services/Ocean/World_Ocean_Base/MapServer/tile/{z}/{y}/{x}',
+            userAgentPackageName: 'com.pttcommunicate.pttmessenger',
+            maxNativeZoom: 13,
+          )
+        else
+          TileLayer(
+            urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+            userAgentPackageName: 'com.pttcommunicate.pttmessenger',
+          ),
+
+        // ─── NOAA Nautical Charts ────────────────────────────────────
+        if (_showNoaaCharts)
+          // ✅ NOAA Raster Navigational Charts (free, no API key)
+          TileLayer(
+            urlTemplate:
+                'https://tileservice.charts.noaa.gov/tiles/50000_1/{z}/{x}/{y}.png',
+            userAgentPackageName: 'com.pttcommunicate.pttmessenger',
+            maxNativeZoom: 18,
+            tileProvider: NetworkTileProvider(),
+            errorTileCallback: (tile, error, stackTrace) {},
+          ),
+
+        // ─── Maritime overlays ───────────────────────────────────────
+        // OpenSeaMap seamark layer (nav aids, buoys, hazards)
+        TileLayer(
+          urlTemplate: 'https://tiles.openseamap.org/seamark/{z}/{x}/{y}.png',
+          userAgentPackageName: 'com.pttcommunicate.pttmessenger',
+        ),
+
+        // ✅ Maritime traffic separation schemes + closures (no API key)
+        if (_showTrafficLayer)
+          TileLayer(
+            urlTemplate:
+                'https://tiles.openseamap.org/routing/{z}/{x}/{y}.png',
+            userAgentPackageName: 'com.pttcommunicate.pttmessenger',
+            tileProvider: NetworkTileProvider(),
+            errorTileCallback: (tile, error, stackTrace) {},
+          ),
+
+        // ─── Depth contours ──────────────────────────────────────────
         if (isDepthShow)
           TileLayer(
-            urlTemplate: "https://tiles.arcgis.com/tiles/C8EMgrsFcRFL6LrL/arcgis/rest/services/GEBCO_contours/MapServer/tile/{z}/{y}/{x}",
+            urlTemplate:
+                'https://tiles.arcgis.com/tiles/C8EMgrsFcRFL6LrL/arcgis/rest/services/GEBCO_contours/MapServer/tile/{z}/{y}/{x}',
             userAgentPackageName: 'com.pttcommunicate.pttmessenger',
           ),
       ];
     });
+  }
+
+  /// Toggle NOAA charts layer
+  void toggleNoaaCharts() {
+    _showNoaaCharts = !_showNoaaCharts;
+    _updateMapLayers();
+  }
+
+  /// Toggle Esri Ocean satellite base
+  void toggleSatellite() {
+    _showSatellite = !_showSatellite;
+    _updateMapLayers();
+  }
+
+  /// Toggle maritime traffic separation overlay
+  void toggleTrafficLayer() {
+    _showTrafficLayer = !_showTrafficLayer;
+    _updateMapLayers();
   }
 
   String direction(double heading) {
@@ -351,11 +427,9 @@ void startTrip() async {
         print("❌ No compass sensor found on this device.");
       }
     });
-    _initialTimer = Timer(Duration(seconds: 20), () {
+    // ✅ Call once — Firestore .snapshots() is already real-time, no need to poll
+    _initialTimer = Timer(Duration(seconds: 5), () {
       listenForUserLocations();
-      _locationListenerTimer = Timer.periodic(Duration(minutes: 3), (timer) {
-        listenForUserLocations();
-      });
     });
     WidgetsBinding.instance.addObserver(this);
     _updateMapLayers();
@@ -602,13 +676,106 @@ Future<void> resumeIfRunning() async {
     ];
   }
 
+  /// Fetch OSRM route + extract turn-by-turn steps (free, no API key)
   Future<void> _drawPolyline(LatLng destination) async {
     Position position = await Geolocator.getCurrentPosition();
-    LatLng myLocation = LatLng(position.latitude, position.longitude);
-    setState(() {
-      _polylinePoints = [myLocation, destination];
-      print("Current Location: $myLocation");
-      print("Destination: $destination");
+    final LatLng myLocation = LatLng(position.latitude, position.longitude);
+
+    try {
+      // ✅ OSRM open-source routing (no API key required)
+      final url = Uri.parse(
+        'https://router.project-osrm.org/route/v1/driving/'
+        '${myLocation.longitude},${myLocation.latitude};'
+        '${destination.longitude},${destination.latitude}'
+        '?steps=true&geometries=geojson&overview=full',
+      );
+
+      final response = await http.get(url);
+      if (response.statusCode == 200) {
+        final json = jsonDecode(response.body);
+        final route = json['routes'][0];
+        final legs = route['legs'] as List;
+
+        // ─── Extract polyline coordinates ────────────────────────────
+        final coords = route['geometry']['coordinates'] as List;
+        final routeLatLngs =
+            coords.map((c) => LatLng(c[1] as double, c[0] as double)).toList();
+
+        // ─── Extract step-by-step instructions ──────────────────────
+        final List<String> steps = [];
+        for (final leg in legs) {
+          for (final step in leg['steps'] as List) {
+            final maneuver = step['maneuver'];
+            final type = maneuver['type'] ?? '';
+            final modifier = maneuver['modifier'] ?? '';
+            final name = step['name'] ?? '';
+            final distanceM = (step['distance'] as num).toInt();
+            final dist = distanceM >= 1000
+                ? '${(distanceM / 1000).toStringAsFixed(1)} km'
+                : '$distanceM m';
+            final direction = modifier.isNotEmpty ? '$type $modifier' : type;
+            steps.add('$direction on $name ($dist)'.trim());
+          }
+        }
+
+        setState(() {
+          _polylinePoints = routeLatLngs;
+          _navSteps = steps;
+          _currentStep = 0;
+          _isNavigating = steps.isNotEmpty;
+          _currentInstruction = steps.isNotEmpty ? steps[0] : '';
+          print('🗺 Route: ${routeLatLngs.length} points, ${steps.length} steps');
+        });
+
+        // ─── Auto-advance steps as user moves ────────────────────────
+        _startNavStepTracker(destination);
+      } else {
+        // Fallback: straight line if OSRM fails
+        setState(() {
+          _polylinePoints = [myLocation, destination];
+          _isNavigating = false;
+        });
+      }
+    } catch (e) {
+      debugPrint('❌ Routing error: $e');
+      setState(() {
+        _polylinePoints = [myLocation, destination];
+        _isNavigating = false;
+      });
+    }
+  }
+
+  Timer? _navStepTimer;
+
+  /// Advance navigation step when user is within 30m of the current waypoint
+  void _startNavStepTracker(LatLng destination) {
+    _navStepTimer?.cancel();
+    _navStepTimer = Timer.periodic(const Duration(seconds: 5), (_) {
+      if (!_isNavigating || _navSteps.isEmpty) {
+        _navStepTimer?.cancel();
+        return;
+      }
+      // Check if near destination → end navigation
+      final dist = _calculateDistance(
+        currentLocation.latitude, currentLocation.longitude,
+        destination.latitude, destination.longitude,
+      );
+      if (dist < 0.05) { // within 50m of destination
+        setState(() {
+          _isNavigating = false;
+          _currentInstruction = '✅ You have arrived!';
+          _navSteps.clear();
+        });
+        _navStepTimer?.cancel();
+        return;
+      }
+      // Advance step if within 80m of next waypoint
+      if (_currentStep < _navSteps.length - 1) {
+        setState(() {
+          _currentStep++;
+          _currentInstruction = _navSteps[_currentStep];
+        });
+      }
     });
   }
 
@@ -1306,6 +1473,50 @@ Future<void> resumeIfRunning() async {
           MarkerLayer(
             markers: _userMarkers,
           ),
+
+          // ✅ Turn-by-turn navigation instruction banner
+          if (_isNavigating && _currentInstruction.isNotEmpty)
+            Align(
+              alignment: Alignment.topCenter,
+              child: Padding(
+                padding: const EdgeInsets.only(top: 60),
+                child: Container(
+                  margin: const EdgeInsets.symmetric(horizontal: 16),
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                  decoration: BoxDecoration(
+                    color: Colors.blue.shade800.withOpacity(0.92),
+                    borderRadius: BorderRadius.circular(14),
+                    boxShadow: const [
+                      BoxShadow(color: Colors.black26, blurRadius: 8, offset: Offset(0, 3)),
+                    ],
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Icon(Icons.turn_right, color: Colors.white, size: 22),
+                      const SizedBox(width: 10),
+                      Flexible(
+                        child: Text(
+                          _currentInstruction,
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 14,
+                            fontWeight: FontWeight.w600,
+                          ),
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      Text(
+                        '${_currentStep + 1}/${_navSteps.length}',
+                        style: const TextStyle(color: Colors.white70, fontSize: 12),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
         ],
       ),
     );
@@ -1399,13 +1610,18 @@ Marker _buildShipMarker(Ship ship) {
   @override
   void dispose() {
     _timerx.cancel();
+    _initialTimer?.cancel();
+    _locationListenerTimer?.cancel();
+    _navStepTimer?.cancel();
+    // ✅ Cancel Firestore listener — prevents memory leak over long sessions
+    _userLocationsSubscription?.cancel();
     final aisService = Provider.of<AISService>(context, listen: true);
     aisService.showShips = false;
     Provider.of<AISService>(context, listen: false).disconnect();
     LocationUpdater().stopLocationUpdates();
     _compassSub?.cancel();
-    super.dispose();
     KeepScreenOn.turnOn(on: false);
+    super.dispose();
   }
 
   @override
@@ -1452,7 +1668,13 @@ Marker _buildShipMarker(Ship ship) {
   }
 
 void listenForUserLocations() {
-  FirebaseFirestore.instance.collection('Users').snapshots().listen((snapshot) {
+  // ✅ Cancel any existing listener before creating a new one
+  _userLocationsSubscription?.cancel();
+  _userLocationsSubscription = FirebaseFirestore.instance
+      .collection('Users')
+      .snapshots()
+      .listen((snapshot) {
+    if (!mounted) return; // ✅ Safety check — don't setState on disposed widget
     if (snapshot.docs.isNotEmpty) {
       final users = snapshot.docs.map((doc) {
         final data = doc.data();
@@ -1463,6 +1685,8 @@ void listenForUserLocations() {
       usersCache = users; // cache for toggle
       _updateMarkersFromFirestore(usersCache, currentLocation, SliderUsers);
     }
+  }, onError: (e) {
+    debugPrint('⚠️ User locations listener error: $e');
   });
 }
 

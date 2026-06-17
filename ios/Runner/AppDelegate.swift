@@ -51,7 +51,18 @@ import PushToTalk
                 // Request to join a default Walkie-Talkie channel so we can receive pushes
                 let channelUUID = UUID(uuidString: "00000000-0000-0000-0000-000000000000")!
                 let descriptor = PTChannelDescriptor(name: "Walkie-Talkie", image: nil)
-                manager.requestJoinChannel(channelUUID: channelUUID, descriptor: descriptor)
+                
+                if let activeUUID = manager.activeChannelUUID {
+                    if activeUUID == channelUUID {
+                        print("✅ Already joined PTT Channel")
+                    } else {
+                        print("♻️ Leaving previous PTT channel to prevent limit error")
+                        manager.leaveChannel(channelUUID: activeUUID)
+                        manager.requestJoinChannel(channelUUID: channelUUID, descriptor: descriptor)
+                    }
+                } else {
+                    manager.requestJoinChannel(channelUUID: channelUUID, descriptor: descriptor)
+                }
             }
         }
     } else {

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:convert';
 import 'dart:io';
 
@@ -31,11 +32,26 @@ class WebSocketPTTController with WidgetsBindingObserver {
   final AudioRecorder _recorder = AudioRecorder();
   final AudioPlayer _player = AudioPlayer();
 
+  // ✅ Playback queue — prevents audio chunks from overlapping
+  final Queue<String> _playQueue = Queue<String>();
+  bool _isPlaying = false;
+
+  // ✅ Real-time chunking — sends audio every 1.5s while button is held
+  Timer? _chunkTimer;
+
   String? senderId;
   String? groupId;
   String? _filePath;
   bool isRecording = false;
   bool isConnected = false;
+
+  // ✅ Voice-optimized codec config — 4× smaller than previous 44100/128kbps
+  static const RecordConfig _voiceConfig = RecordConfig(
+    encoder: AudioEncoder.aacLc,
+    sampleRate: 16000, // was 44100 — voice-only needs 16kHz
+    bitRate: 32000,    // was 128000 — 32kbps is plenty for voice
+    numChannels: 1,
+  );
 
   // ------------------------------------------------------------
   // INITIALIZE
@@ -52,12 +68,6 @@ class WebSocketPTTController with WidgetsBindingObserver {
     if (Platform.isIOS) forceSpeakerOnIOS();
 
     startNetworkMonitor();
-
-    _player.playerStateStream.listen((state) async {
-      if (state.processingState == ProcessingState.completed) {
-        await _player.stop(); // fully reset
-      }
-    });
 
     debugPrint("🎧 PTT Controller Ready");
   }
@@ -106,14 +116,12 @@ class WebSocketPTTController with WidgetsBindingObserver {
     try {
       _channel = WebSocketChannel.connect(
           Uri.parse("wss://ptt.visionvivante.in")
-          // Uri.parse("ws://192.168.3.192:8080"), // ✅ Local Mac server for testing
           );
 
       _channel!.sink.add(jsonEncode({
         "type": "register",
         "userId": senderId,
       }));
-      // (catch block removed here)
 
       // ✅ Send our VoIP push token to the server so it can wake us when offline
       if (Platform.isIOS) {
@@ -149,16 +157,13 @@ class WebSocketPTTController with WidgetsBindingObserver {
   void _startPing() {
     _pingTimer?.cancel();
     _pingTimer = Timer.periodic(const Duration(seconds: 20), (_) async {
-      // Check network connectivity
       var connectivityResult = await Connectivity().checkConnectivity();
       if (connectivityResult == ConnectivityResult.none) return;
 
-      // Make sure the WebSocket is not null and still open
       if (_channel != null) {
         try {
           _channel!.sink.add(jsonEncode({"type": "ping"}));
         } catch (e) {
-          // The channel might be closed or in error state
           print("Ping failed: $e");
         }
       }
@@ -174,50 +179,57 @@ class WebSocketPTTController with WidgetsBindingObserver {
     if (data["type"] == "audio") {
       final bytes = base64Decode(data["chunk"]);
       final dir = await getApplicationDocumentsDirectory();
-
       final path =
           "${dir.path}/rx_${DateTime.now().millisecondsSinceEpoch}.aac";
       final file = File(path);
       await file.writeAsBytes(bytes, flush: true);
 
-      playReceived(path);
+      // ✅ Queue chunk instead of playing immediately (prevents overlapping audio)
+      _enqueuePlayback(path);
     }
   }
 
   // ------------------------------------------------------------
-  // PLAYBACK (Latest always wins)
+  // PLAYBACK QUEUE — gapless, no overlapping
   // ------------------------------------------------------------
-  Future<void> playReceived(String path) async {
+  void _enqueuePlayback(String path) {
+    _playQueue.add(path);
+    if (!_isPlaying) _processPlayQueue();
+  }
+
+  Future<void> _processPlayQueue() async {
+    if (_playQueue.isEmpty) {
+      _isPlaying = false;
+      return;
+    }
+    _isPlaying = true;
+    final path = _playQueue.removeFirst();
+
     try {
-      // final session = await AudioSession.instance;
-
-      // await session.configure(
-      //   const AudioSessionConfiguration.music(),
-      // );
-      // await session.setActive(true);
-
       if (Platform.isIOS) forceSpeakerOnIOS();
 
-      // // 🛑 Ensure previous audio is fully stopped before new one loads
-      // if (_player.playing) {
-      //   await _player.stop();
-      // }
-
-      // 🧹 Reset + load new audio
-      await _player.setAudioSource(
-        AudioSource.uri(Uri.file(path)),
-      );
-
+      await _player.setAudioSource(AudioSource.uri(Uri.file(path)));
       await _player.play();
-      print("playing audio");
+
+      // Wait until this chunk finishes before playing the next
+      await _player.playerStateStream.firstWhere(
+        (s) => s.processingState == ProcessingState.completed ||
+               s.processingState == ProcessingState.idle,
+      );
     } catch (e, stack) {
-      print("❌ not playing audio: $e");
-      print(stack);
+      debugPrint("❌ Playback error: $e");
+      debugPrint(stack.toString());
+    } finally {
+      // ✅ Always clean up temp files to avoid storage bloat
+      try { await File(path).delete(); } catch (_) {}
     }
+
+    // Play next chunk
+    _processPlayQueue();
   }
 
   // ------------------------------------------------------------
-  // RECORDING
+  // RECORDING — with real-time chunked streaming
   // ------------------------------------------------------------
   Future<void> startRecording() async {
     if (isRecording) return;
@@ -227,42 +239,72 @@ class WebSocketPTTController with WidgetsBindingObserver {
       return;
     }
 
+    await _startNewChunk();
+    isRecording = true;
+
+    // ✅ Send audio chunks every 1.5s while button is held
+    // This means recipients hear you WHILE you're still talking
+    _chunkTimer = Timer.periodic(const Duration(milliseconds: 1500), (_) async {
+      if (!isRecording) {
+        _chunkTimer?.cancel();
+        return;
+      }
+      await _flushAndContinue();
+    });
+  }
+
+  /// Start recording into a new temp file
+  Future<void> _startNewChunk() async {
     final dir = await getApplicationDocumentsDirectory();
     _filePath = "${dir.path}/tx_${DateTime.now().millisecondsSinceEpoch}.aac";
+    await _recorder.start(_voiceConfig, path: _filePath!);
+  }
 
-    await _recorder.start(
-      const RecordConfig(
-        encoder: AudioEncoder.aacLc,
-        sampleRate: 44100,
-        bitRate: 128000,
-        numChannels: 1,
-      ),
-      path: _filePath!,
-    );
-
-    isRecording = true;
+  /// Stop current chunk, send it, start a new chunk (called while button held)
+  Future<void> _flushAndContinue() async {
+    if (!isRecording) return;
+    final currentPath = _filePath;
+    await _recorder.stop();
+    if (currentPath != null) await _sendFile(currentPath);
+    await _startNewChunk(); // immediately start recording next chunk
   }
 
   Future<void> stopRecording() async {
     if (!isRecording) return;
+    _chunkTimer?.cancel();
+    _chunkTimer = null;
     await _recorder.stop();
     isRecording = false;
   }
 
   Future<void> sendAudio() async {
+    // ✅ Send the final chunk after button is released
     if (_filePath == null || groupId == null || !isConnected) return;
+    await _sendFile(_filePath!);
+  }
 
-    final file = File(_filePath!);
+  Future<void> _sendFile(String path) async {
+    if (groupId == null || !isConnected) return;
+    final file = File(path);
     if (!await file.exists()) return;
+    final bytes = await file.readAsBytes();
+    if (bytes.isEmpty) return;
 
     final msg = jsonEncode({
       "type": "audio",
       "groupId": groupId,
       "sender": senderId,
-      "chunk": base64Encode(await file.readAsBytes()),
+      "chunk": base64Encode(bytes),
     });
 
-    _channel?.sink.add(msg);
+    try {
+      _channel?.sink.add(msg);
+    } catch (e) {
+      debugPrint("❌ Failed to send chunk: $e");
+    }
+
+    // ✅ Clean up sent file immediately
+    try { await file.delete(); } catch (_) {}
   }
 
   // ------------------------------------------------------------
@@ -305,6 +347,7 @@ class WebSocketPTTController with WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
     _pingTimer?.cancel();
     _netRetryTimer?.cancel();
+    _chunkTimer?.cancel();
     await _player.dispose();
     await _recorder.dispose();
     await _wsSubscription?.cancel();
@@ -322,7 +365,6 @@ class WebSocketPTTController with WidgetsBindingObserver {
     _isHandlingPush = true;
     connect(id);
     joinGroup(id);
-    // Reset the flag after 10 seconds (enough time to receive and play audio)
     Future.delayed(const Duration(seconds: 10), () {
       _isHandlingPush = false;
     });

@@ -30,6 +30,17 @@ class AgoraController {
     await engine!.setChannelProfile(ChannelProfileType.channelProfileCommunication);
     await engine!.setClientRole(role: ClientRoleType.clientRoleBroadcaster);
 
+    // ✅ Voice-optimized audio: 16kHz mono speech codec — matches PTT use case
+    await engine!.setAudioProfile(
+      profile: AudioProfileType.audioProfileSpeechStandard,
+      scenario: AudioScenarioType.audioScenarioChatroom,
+    );
+
+    // ✅ AI noise suppression — removes wind, engine noise common on boats
+    await engine!.setParameters('{"che.audio.enable_aiaec":true}');
+    await engine!.setParameters('{"che.audio.enable_ainr":true}');
+    await engine!.setParameters('{"che.audio.ns.mode":2}'); // Aggressive NS
+
     // ✅ Set session once — music mode, no volume popup
     await _configureAudioSession();
 

@@ -328,13 +328,22 @@ static Future<void> deleteUserAccount() async {
     connectedRef.onValue.listen((event) async {
       final isConnected = event.snapshot.value as bool? ?? false;
       if (isConnected) {
-        _realtime.ref().child(currentUer.userId).update(_isUserOnline(true));
+        _realtime.ref().child(currentUer.userId).update(_isUserOnline(true)).catchError((e) {
+          debugPrint('Firebase update error: $e');
+        });
       } else {
-        _realtime
-            .ref()
-            .child(currentUer.userId)
-            .onDisconnect()
-            .update(_isUserOnline(false));
+        try {
+          _realtime
+              .ref()
+              .child(currentUer.userId)
+              .onDisconnect()
+              .update(_isUserOnline(false))
+              .catchError((e) {
+            debugPrint('Firebase onDisconnect error: $e');
+          });
+        } catch (e) {
+          debugPrint('Firebase onDisconnect sync error: $e');
+        }
       }
     });
   }

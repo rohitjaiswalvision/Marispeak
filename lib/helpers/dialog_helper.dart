@@ -52,17 +52,21 @@ abstract class DialogHelper {
         break;
     }
 
-    Get.snackbar(
-      title,
-      message,
-      colorText: Colors.white,
-      icon: const Icon(IconlyLight.dangerCircle, color: Colors.white),
-      backgroundColor: bgColor,
-      snackPosition: position,
-      borderRadius: defaultRadius,
-      duration: Duration(seconds: duration),
-      margin: const EdgeInsets.all(defaultMargin),
-    );
+    try {
+      Get.snackbar(
+        title,
+        message,
+        colorText: Colors.white,
+        icon: const Icon(IconlyLight.dangerCircle, color: Colors.white),
+        backgroundColor: bgColor,
+        snackPosition: position,
+        borderRadius: defaultRadius,
+        duration: Duration(seconds: duration),
+        margin: const EdgeInsets.all(defaultMargin),
+      );
+    } catch (e) {
+      debugPrint('Failed to show snackbar (Overlay likely missing): $e');
+    }
   }
 
   static void showProcessingDialog({

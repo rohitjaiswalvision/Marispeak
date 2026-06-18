@@ -1,19 +1,21 @@
-/**
- * Railway WebSocket PTT Server — with iOS VoIP Push Support
- * 
- * HOW TO USE:
- * 1. npm install ws @parse/node-apn
- * 2. Set environment variables on Railway:
- *    - VOIP_KEY_PATH   → path to your .p8 VoIP key file (or paste inline)
- *    - VOIP_KEY_ID     → 10-char Key ID from Apple Developer portal
- *    - TEAM_ID         → Your Apple Team ID (R7VBW74U4H for Thalas Apps)
- *    - BUNDLE_ID       → com.pttcommunicate.pttmessenger
- * 3. Deploy to Railway
- */
+import express from "express";
+import http from "http";
+import WebSocket, { WebSocketServer } from "ws";
+import apn from "@parse/node-apn";
+import path from "path";
+import { fileURLToPath } from 'url';
 
-const WebSocket = require("ws");
-const apn = require("@parse/node-apn");
-const path = require("path");
+// Setup for ES Modules __dirname
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const app = express();
+app.get("/testing", (req, res) => {
+  console.log("=====hello World");
+  res.send("✅ Voice WebSocket server running!");
+});
+
+const server = http.createServer(app);
 
 // ─────────────────────────────────────────────────────────────────
 // APNs VoIP Push Setup
@@ -24,11 +26,13 @@ function initAPNs() {
   try {
     const options = {
       token: {
-        key: path.join(__dirname, "AuthKey_AC7HTJC42H.p8"), // Must match the filename exactly
-        keyId: "AC7HTJC42H",            // ✅ Corrected Key ID (must match the .p8 file)
-        teamId: "R7VBW74U4H",           // <-- Your Apple Team ID
+        key: path.join(__dirname, "AuthKey_AC7HTJC42H.p8"), // ✅ Must be in same folder as server.js
+        keyId: "AC7HTJC42H",                               // ✅ 10-char Key ID
+        teamId: "R7VBW74U4H",                              // ✅ Apple Team ID
       },
-      production: false, // ✅ MUST be false while testing in Xcode! (Sandbox tokens will fail in production)
+      // ✅ TRUE for TestFlight and App Store (production APNs tokens)
+      // Set to FALSE only when testing directly via Xcode USB cable (sandbox tokens)
+      production: false,
     };
 
     apnProvider = new apn.Provider(options);
@@ -38,26 +42,30 @@ function initAPNs() {
   }
 }
 
-async function sendVoIPPush(deviceToken, senderName, groupId) {
+async function sendVoIPPush(deviceToken, senderName, groupId, senderId) {
   if (!apnProvider || !deviceToken) return;
 
   const note = new apn.Notification();
-  note.expiry = 0; // Deliver immediately or drop
-  note.priority = 10; // REQUIRED for Apple Push To Talk
-  note.payload = {
+  note.expiry = 0;        // ✅ Deliver immediately
+  note.priority = 10;     // ✅ REQUIRED header for Apple Push To Talk
+  note.rawPayload = {
+    aps: {
+      "channel-uuid": "00000000-0000-0000-0000-000000000000",
+      "active_remote_participant": senderName || "PTT Message"
+    },
     type: "ptt",
     senderName: senderName || "PTT Message",
     groupId: groupId || "",
+    senderId: senderId || "",
   };
-  // VoIP pushes must use the .voip-ptt topic suffix for PushToTalk framework
+  // VoIP pushes must use the .voip-ptt topic suffix for iOS 16 PushToTalk framework
   note.topic = "com.pttcommunicate.pttmessenger.voip-ptt";
-  note.pushType = "pushtotalk"; // REQUIRED header for Apple APNs PushToTalk
+  note.pushType = "pushtotalk"; // ✅ REQUIRED header for Apple Push To Talk
 
   try {
     const result = await apnProvider.send(note, deviceToken);
     if (result.failed.length > 0) {
-      const failure = result.failed[0];
-      console.warn("⚠️ VoIP push failed:", failure.response || failure.error);
+      console.warn("⚠️ VoIP push failed:", result.failed[0].response);
     } else {
       console.log(`📲 VoIP push sent to ${deviceToken.substring(0, 10)}...`);
     }
@@ -69,10 +77,10 @@ async function sendVoIPPush(deviceToken, senderName, groupId) {
 // ─────────────────────────────────────────────────────────────────
 // WebSocket Server
 // ─────────────────────────────────────────────────────────────────
-const PORT = process.env.PORT || 3000;
-const wss = new WebSocket.Server({ port: PORT });
+const PORT = process.env.PORT || 3010;
+const wss = new WebSocketServer({ server });
 
-// Map: userId → { ws, voipToken, groupId, name }
+// Map: userId → { ws, voipToken, groupId, name, pendingAudio }
 const clients = new Map();
 
 initAPNs();
@@ -94,7 +102,6 @@ wss.on("connection", (ws) => {
       if (!userId) return;
 
       const existing = clients.get(userId) || {};
-      
       const newClient = {
         ...existing,
         ws,
@@ -102,7 +109,7 @@ wss.on("connection", (ws) => {
         groupId: existing.groupId || userId,
         name: msg.name || existing.name || "User",
       };
-      
+
       clients.set(userId, newClient);
       console.log(`✅ Registered: ${userId}`);
 
@@ -136,29 +143,40 @@ wss.on("connection", (ws) => {
 
     // ── AUDIO ─────────────────────────────────────────────────
     if (msg.type === "audio" && userId) {
-      const groupId = msg.groupId?.trim();
+      const targetGroupId = msg.groupId?.trim();
       const chunk = msg.chunk;
       const senderName = clients.get(userId)?.name || "PTT";
 
-      // Broadcast to all group members (except sender)
+      console.log(`🎙️ Audio chunk from ${userId} to group ${targetGroupId}`);
       for (const [uid, client] of clients.entries()) {
-        if (uid === userId) continue;
-        if (client.groupId !== groupId) continue;
+        console.log(`  - Checking client ${uid} in group ${client.groupId}...`);
+        if (uid === userId) {
+          console.log(`    -> Skipped (is sender)`);
+          continue;
+        }
+
+        // ✅ Deliver if:
+        //   1. The client's userId matches the targetGroupId (1-on-1 direct delivery)
+        //   2. OR the client is subscribed to the targetGroupId (group broadcast)
+        const isDirectTarget = uid === targetGroupId;
+        const isGroupMember = client.groupId === targetGroupId;
+        if (!isDirectTarget && !isGroupMember) {
+          console.log(`    -> Skipped (wrong group)`);
+          continue;
+        }
 
         if (client.ws && client.ws.readyState === WebSocket.OPEN) {
-          // ✅ Client is connected and awake — send audio directly
+          console.log(`    -> ✅ Sent audio to ${uid}`);
           client.ws.send(
             JSON.stringify({ type: "audio", chunk, sender: userId })
           );
         } else {
-          // ✅ Client WebSocket is closed (app in background/locked)
-          // Send a VoIP push to wake the app!
+          // Client is offline — send a VoIP push to wake the app!
           if (client.voipToken) {
             console.log(`📲 Client ${uid} is offline — sending VoIP push`);
-            // Store the audio to send when they wake up
             client.pendingAudio = client.pendingAudio || [];
             client.pendingAudio.push({ chunk, sender: userId });
-            await sendVoIPPush(client.voipToken, senderName, groupId);
+            await sendVoIPPush(client.voipToken, senderName, targetGroupId, userId);
           } else {
             console.log(`⚠️ Client ${uid} is offline but has no VoIP token`);
           }
@@ -170,7 +188,7 @@ wss.on("connection", (ws) => {
     if (msg.type === "ping") {
       try {
         ws.send(JSON.stringify({ type: "pong" }));
-      } catch (_) {}
+      } catch (_) { }
     }
   });
 
@@ -190,4 +208,7 @@ wss.on("connection", (ws) => {
   });
 });
 
-console.log(`🚀 PTT Voice Server running on port ${PORT}`);
+// Using single server.listen (Express + WS attached)
+server.listen(PORT, () => {
+  console.log(`🚀 PTT Voice Server running on port ${PORT}`);
+});

@@ -9,6 +9,7 @@ import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:get/get.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 import 'package:marispeaks/config/app_config.dart';
+import 'package:marispeaks/config/environment.dart';
 import 'package:marispeaks/controllers/preferences_controller.dart';
 import 'package:marispeaks/helpers/notification_helper.dart';
 import 'package:marispeaks/helpers/settings_provider.dart';
@@ -47,7 +48,7 @@ Future<void> firebaseMessagingBackgroundHandler(RemoteMessage message) async {
   final notificationBody = message.notification?.body?.toLowerCase() ?? '';
   final chatId = data['chatId'] ?? '';
   final groupId = data['groupId'] ?? '';
-  final senderId =  data ['senderId'] ?? '';
+  final senderId = data['senderId'] ?? '';
   final type = data['type'] ?? '';
   final seenByRaw = data['seenBy'];
 
@@ -61,7 +62,7 @@ Future<void> firebaseMessagingBackgroundHandler(RemoteMessage message) async {
 // ✅ Skip notification if user is already in that chat
   if (MessageController.currentOpenChatId != null &&
       (MessageController.currentOpenChatId == chatId ||
-       MessageController.currentOpenChatId == senderId && type != 'call')) {
+          MessageController.currentOpenChatId == senderId && type != 'call')) {
     print('[Notification] Skipping notification — chat already open');
     return;
   }
@@ -69,30 +70,28 @@ Future<void> firebaseMessagingBackgroundHandler(RemoteMessage message) async {
   // ✅ Special group handling
   if (groupId == "1e8bf062-772f-42b3-9a09-7f0021f936db" ||
       chatId == "1e8bf062-772f-42b3-9a09-7f0021f936db") {
+    if (notificationBody.contains("group msg")) {
+      WebSocketPTTController().joinGroup(chatId);
+    }
 
-       if (notificationBody.contains("group msg")) {
-         WebSocketPTTController().joinGroup(chatId);
-      }
+    if (notificationBody.contains("group ptt ends")) {
+      // WebSocketPTTController().joinGroup(currentUser);
+    }
 
-      if (notificationBody.contains("group ptt ends")) {
-         WebSocketPTTController().joinGroup(currentUser);
-      }
- 
- 
-    print('[FCM] onMessage (background) - abc group msg allowed: ${message.data}');
+    print(
+        '[FCM] onMessage (background) - abc group msg allowed: ${message.data}');
     showLocalNotification(message);
-
   } else {
     if (notificationBody.contains("group msg")) {
-         WebSocketPTTController().joinGroup(chatId);
-      }
+      WebSocketPTTController().joinGroup(chatId);
+    }
 
-      if (notificationBody.contains("group ptt ends")) {
-         WebSocketPTTController().joinGroup(currentUser);
-      }
+    if (notificationBody.contains("group ptt ends")) {
+      // WebSocketPTTController().joinGroup(currentUser);
+    }
 
     print('[FCM] group msg: $groupId');
-  
+
     showLocalNotification(message);
   }
 
@@ -115,11 +114,24 @@ Future<void> firebaseMessagingBackgroundHandler(RemoteMessage message) async {
   if (type == 'call') {
     await NotificationHelper.onNotificationClick(payload: data);
   }
-}
 
+  if (type == 'ptt') {
+    print('[FCM] Background PTT received for group $groupId');
+    WebSocketPTTController().handlePushConnect(groupId, currentUser);
+  }
+}
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // ✅ Print environment info at startup
+  printEnvironmentInfo();
+
+  // ✅ Store PTT server URL in UserDefaults for native code to use
+  final prefs = await SharedPreferences.getInstance();
+  await prefs.setString(
+      'ptt_server_url', Environment.current.pttServerUrl);
+  print('📍 Stored PTT server URL: ${Environment.current.pttServerUrl}');
 
   final appDocDir = await getApplicationDocumentsDirectory();
   Hive.init(appDocDir.path);
@@ -138,8 +150,9 @@ Future<void> main() async {
   VoIPService().onVoIPPushReceived = (payload) {
     print('[VoIP] Push Received: $payload');
     final groupId = payload['groupId'];
+    final userId = FirebaseAuth.instance.currentUser?.uid ?? '';
     if (groupId != null && groupId.isNotEmpty) {
-      WebSocketPTTController().handlePushConnect(groupId);
+      WebSocketPTTController().handlePushConnect(groupId, userId);
     }
   };
 
@@ -220,32 +233,30 @@ Future<void> setupLocalNotifications() async {
   final InitializationSettings initSettings =
       InitializationSettings(android: androidInit, iOS: iosInit);
 
- await flutterLocalNotificationsPlugin.initialize(
-  initSettings,
-  onDidReceiveNotificationResponse: (NotificationResponse response) {
-    if (response.payload != null) {
-      try {
-        final data = jsonDecode(response.payload!);
-        print('[NotificationHelper] Local notification clicked');
-        
-        // Check if it's a call notification
-        if (data['type'] == 'call') {
-          // Handle call - don't open chat
-          NotificationHelper.onNotificationClick(payload: data);
-        } else {
-          // Handle chat message - open chat
-          NotificationHelper.onNotificationClick(payload: data);
-          NotificationHelper.openChatFromPayload(data);
+  await flutterLocalNotificationsPlugin.initialize(
+    initSettings,
+    onDidReceiveNotificationResponse: (NotificationResponse response) {
+      if (response.payload != null) {
+        try {
+          final data = jsonDecode(response.payload!);
+          print('[NotificationHelper] Local notification clicked');
+
+          // Check if it's a call notification
+          if (data['type'] == 'call') {
+            // Handle call - don't open chat
+            NotificationHelper.onNotificationClick(payload: data);
+          } else {
+            // Handle chat message - open chat
+            NotificationHelper.onNotificationClick(payload: data);
+            NotificationHelper.openChatFromPayload(data);
+          }
+        } catch (e) {
+          print('[NotificationHelper] Payload decode error: $e');
         }
-      } catch (e) {
-        print('[NotificationHelper] Payload decode error: $e');
       }
-    }
-  },
-);
+    },
+  );
 }
-
-
 
 Future<void> setupFirebaseMessaging() async {
   final FirebaseMessaging messaging = FirebaseMessaging.instance;
@@ -254,9 +265,13 @@ Future<void> setupFirebaseMessaging() async {
   // ✅ Request permissions (iOS)
   await messaging.requestPermission(alert: true, badge: true, sound: true);
   // ✅ Print tokens
-  final token = await messaging.getToken().timeout(const Duration(seconds: 3), onTimeout: () => '');
+  final token = await messaging
+      .getToken()
+      .timeout(const Duration(seconds: 3), onTimeout: () => '');
   print('✅ FCM Token: $token');
-  final apnsToken = await messaging.getAPNSToken().timeout(const Duration(seconds: 3), onTimeout: () => null);
+  final apnsToken = await messaging
+      .getAPNSToken()
+      .timeout(const Duration(seconds: 3), onTimeout: () => null);
   print('📱 APNs Token: $apnsToken');
 
   // ✅ Foreground message listener
@@ -274,15 +289,14 @@ Future<void> setupFirebaseMessaging() async {
       final chatId = data['chatId'] ?? '';
       final senderId = data['senderId'] ?? '';
 
-   if (notificationBody.contains("rejected") && type != 'call') {
+      if (notificationBody.contains("rejected") && type != 'call') {
         print('[Notification] Not skipped — Call rejected!');
-     }
-   else{
-      if (openChat == chatId || openChat == senderId) {
-        print('[Notification] Skipping — Chat already open');
-        return;
-       }
-     }
+      } else {
+        if (openChat == chatId || openChat == senderId) {
+          print('[Notification] Skipping — Chat already open');
+          return;
+        }
+      }
     }
     // ✅ Parse seenBy safely
     List<String> seenBy = [];
@@ -295,31 +309,30 @@ Future<void> setupFirebaseMessaging() async {
     }
 
     // ✅ Safe user ID access (foreground only)
-    final String currentUser = customBottomSection.currentState!.currentUser.userId;
-    
+    final String currentUser =
+        customBottomSection.currentState!.currentUser.userId;
 
     // ✅ Specific group/channel logic
     if (groupId == "1e8bf062-772f-42b3-9a09-7f0021f936db" ||
         chatId == "1e8bf062-772f-42b3-9a09-7f0021f936db") {
-
-   if (notificationBody.contains("group msg")) {
-         WebSocketPTTController().joinGroup(chatId);
+      if (notificationBody.contains("group msg")) {
+        WebSocketPTTController().joinGroup(chatId);
       }
 
       if (notificationBody.contains("group ptt ends")) {
-         WebSocketPTTController().joinGroup(currentUser);
+        // WebSocketPTTController().joinGroup(currentUser);
       }
 
-      print('[FCM] onMessage (foreground) - abc group msg allowed: ${message.data}');
+      print(
+          '[FCM] onMessage (foreground) - abc group msg allowed: ${message.data}');
       showLocalNotification(message);
-
     } else {
       if (notificationBody.contains("group msg")) {
-         WebSocketPTTController().joinGroup(chatId);
+        WebSocketPTTController().joinGroup(chatId);
       }
 
       if (notificationBody.contains("group ptt ends")) {
-         WebSocketPTTController().joinGroup(currentUser);
+        // WebSocketPTTController().joinGroup(currentUser);
       }
 
       print('[FCM] group msg: $groupId');
@@ -350,29 +363,29 @@ Future<void> setupFirebaseMessaging() async {
   });
 
   // ✅ Handle when user taps on a notification
- // ✅ Handle when user taps on a notification
-FirebaseMessaging.onMessageOpenedApp.listen((RemoteMessage message) {
-  final data = message.data;
-  
-  // Check if it's a call notification
-  if (data['type'] == 'call') {
-    // Handle call - don't open chat
-    NotificationHelper.onNotificationClick(payload: data);
-  } else {
-    // Handle chat message - open chat
-    NotificationHelper.onNotificationClick(payload: data);
-    NotificationHelper.openChatFromPayload(data);
-  }
-});
-}
+  // ✅ Handle when user taps on a notification
+  FirebaseMessaging.onMessageOpenedApp.listen((RemoteMessage message) {
+    final data = message.data;
 
+    // Check if it's a call notification
+    if (data['type'] == 'call') {
+      // Handle call - don't open chat
+      NotificationHelper.onNotificationClick(payload: data);
+    } else {
+      // Handle chat message - open chat
+      NotificationHelper.onNotificationClick(payload: data);
+      NotificationHelper.openChatFromPayload(data);
+    }
+  });
+}
 
 void showLocalNotification(RemoteMessage message) async {
   final String type = message.data['type'] ?? '';
 
- // ✅ Skip local notification for calls when app is in foreground. The Incoming Call screen will handle the UI and the ringtone!
+  // ✅ Skip local notification for calls when app is in foreground. The Incoming Call screen will handle the UI and the ringtone!
   if (type == 'call') {
-    print('[Notification] Call notification skipped because app is in foreground and will open Incoming Call screen.');
+    print(
+        '[Notification] Call notification skipped because app is in foreground and will open Incoming Call screen.');
     return; // skip showing notification and sound
   }
 
@@ -423,11 +436,10 @@ void showLocalNotification(RemoteMessage message) async {
     _incomingCallNotificationId ?? 0,
     message.notification?.title ?? "New Message",
     message.notification?.body ?? "",
-    notificationDetails, 
+    notificationDetails,
     payload: jsonEncode(message.data),
   );
 }
-
 
 Future<void> handleCallRejected() async {
   print('[Call] Call rejected, removing notification');
@@ -438,7 +450,8 @@ Future<void> handleCallRejected() async {
 
     // Save the ID to SharedPreferences BEFORE clearing it
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setInt('incomingCallNotificationId', _incomingCallNotificationId!);
+    await prefs.setInt(
+        'incomingCallNotificationId', _incomingCallNotificationId!);
 
     _incomingCallNotificationId = null;
   }

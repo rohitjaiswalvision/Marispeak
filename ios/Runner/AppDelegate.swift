@@ -22,6 +22,13 @@ class NativePTTPlayer: NSObject, URLSessionWebSocketDelegate {
     private var currentDisconnectToken: UUID?
     private var endTransactionTimer: Timer?
     
+    // ✅ For Native Sending (Lock Screen PTT)
+    var currentGroupId: String?
+    private var audioRecorder: AVAudioRecorder?
+    private var chunkTimer: Timer?
+    private var currentRecordFileUrl: URL?
+    private var isTransmitting = false
+
     // ✅ Must wait for PushToTalk to fully activate before playing!
     var isAudioSessionActive = false 
 
@@ -61,7 +68,15 @@ class NativePTTPlayer: NSObject, URLSessionWebSocketDelegate {
 
         print("🔊 NativePTTPlayer: Connecting as \(userId) to receive group \(groupId)")
 
-        guard let url = URL(string: "wss://ptt.visionvivante.in") else { return } // 🔧 PRODUCTION
+        // ✅ FORCE development server for now (UserDefaults might not be set yet)
+        let storedUrl = UserDefaults.standard.string(forKey: "flutter.ptt_server_url")
+        let serverUrl = storedUrl ?? "ws://192.168.3.192:3010" // Default to dev, not prod
+        print("🔗 Stored URL: \(storedUrl ?? "nil"), Using: \(serverUrl)")
+        
+        guard let url = URL(string: serverUrl) else { 
+            print("❌ Invalid PTT server URL: \(serverUrl)")
+            return 
+        }
         webSocketTask = urlSession.webSocketTask(with: url)
         webSocketTask?.resume()
 
@@ -113,10 +128,19 @@ class NativePTTPlayer: NSObject, URLSessionWebSocketDelegate {
               let chunk = json["chunk"] as? String,
               let audioData = Data(base64Encoded: chunk) else { return }
 
+        // ✅ FIX: Ignore our own audio chunks to prevent local echo
+        let senderId = json["sender"] as? String ?? ""
+        let myUserId = UserDefaults.standard.string(forKey: "flutter.ptt_user_id") ?? ""
+        if !senderId.isEmpty && senderId == myUserId {
+            print("🔇 NativePTTPlayer: Ignoring our own audio chunk")
+            return
+        }
+
         print("🔊 NativePTTPlayer: Received \(audioData.count) bytes of audio")
         
         DispatchQueue.main.async {
             self.audioQueue.append(audioData)
+            print("📦 Queue size: \(self.audioQueue.count), isPlaying: \(self.isPlaying), sessionActive: \(self.isAudioSessionActive)")
             // ⚡ If sessionDidActivate already fired (consecutive push), play immediately.
             // If session isn't active yet, processQueue() will be triggered by sessionDidActivate.
             self.forceStartIfSessionActive()
@@ -130,20 +154,31 @@ class NativePTTPlayer: NSObject, URLSessionWebSocketDelegate {
         // 🔊 Force the audio to play from the main loud speaker at FULL volume!
         let session = AVAudioSession.sharedInstance()
         do {
-            // ✅ FIX: Use .playback category (not .playAndRecord) for maximum output volume.
-            // .playAndRecord routes audio to the earpiece by default (very quiet).
-            // .playback always routes to the loud speaker when overrideOutputAudioPort(.speaker) is set.
-            try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+            // ✅ FIX: Use .playAndRecord to support both capturing mic (when user holds native PTT button)
+            // and playing loud audio (defaultToSpeaker).
+            try session.setCategory(.playAndRecord, mode: .default, options: [.mixWithOthers, .defaultToSpeaker, .allowBluetooth])
             // ✅ FIX: Must call setActive(true) BEFORE overrideOutputAudioPort, otherwise the
             // override can silently fail on some devices and fall back to the quiet earpiece.
             try session.setActive(true)
             try session.overrideOutputAudioPort(.speaker) // 🔊 CRITICAL for loud volume
-            print("🔊 NativePTTPlayer: Audio session active — full-volume speaker output")
+            print("🔊 NativePTTPlayer: Audio session active — full-volume speaker output (playAndRecord)")
         } catch {
             print("❌ NativePTTPlayer: Failed to configure speaker - \(error)")
         }
 
         processQueue() // Start playing any queued chunks!
+        
+        // If the user pressed Talk and we were waiting for the session to activate:
+        if isTransmitting && audioRecorder == nil {
+            print("🎙️ Starting to record audio chunks (Session is now active)...")
+            startRecordingChunk()
+
+            chunkTimer?.invalidate()
+            chunkTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
+                self?.flushAndContinueRecording()
+            }
+            print("⏱️ Chunk timer started (1.5s interval)")
+        }
     }
 
     // Called when a NEW push arrives and session might ALREADY be active.
@@ -156,7 +191,13 @@ class NativePTTPlayer: NSObject, URLSessionWebSocketDelegate {
     }
 
     private func processQueue() {
-        guard isAudioSessionActive, !isPlaying, !audioQueue.isEmpty else { return }
+        print("🎬 processQueue called: sessionActive=\(isAudioSessionActive), isPlaying=\(isPlaying), queueSize=\(audioQueue.count)")
+        guard isAudioSessionActive, !isPlaying, !audioQueue.isEmpty else { 
+            if !isAudioSessionActive {
+                print("⚠️ Cannot process queue: audio session not active yet")
+            }
+            return 
+        }
         isPlaying = true
         
         let data = audioQueue.removeFirst()
@@ -200,14 +241,154 @@ class NativePTTPlayer: NSObject, URLSessionWebSocketDelegate {
     // Only call this when the PTT session has officially ended (didDeactivate fires).
     func disconnect() {
         isReceiving = false
+        isTransmitting = false
         isAudioSessionActive = false // ✅ ONLY reset here (when PTT session truly ends)
         isPlaying = false
         audioQueue.removeAll()
         audioPlayer?.stop()
         audioPlayer = nil
+        chunkTimer?.invalidate()
+        chunkTimer = nil
+        audioRecorder?.stop()
+        audioRecorder = nil
         webSocketTask?.cancel(with: .normalClosure, reason: nil)
         webSocketTask = nil
         print("🔌 NativePTTPlayer: Disconnected")
+    }
+
+    // ────────────────────────────────────────────────────────────
+    // MARK: - Native Transmitting (Lock Screen PTT)
+    // ────────────────────────────────────────────────────────────
+    func startTransmitting(groupId: String) {
+        print("🎤 startTransmitting called for group: \(groupId)")
+        
+        let userId = UserDefaults.standard.string(forKey: "flutter.ptt_user_id") ?? ""
+        print("👤 User ID: \(userId)")
+        
+        guard !userId.isEmpty else {
+            print("❌ Cannot transmit: No userId in UserDefaults")
+            return
+        }
+
+        isTransmitting = true
+        self.currentGroupId = groupId
+        print("✅ isTransmitting = true, currentGroupId = \(groupId)")
+
+        // Ensure WebSocket is connected
+        if webSocketTask == nil {
+            print("🔌 WebSocket is nil, creating new connection...")
+            // ✅ FORCE development server for now (UserDefaults might not be set yet)
+            let storedUrl = UserDefaults.standard.string(forKey: "flutter.ptt_server_url")
+            let serverUrl = storedUrl ?? "ws://192.168.3.192:3010" // Default to dev, not prod
+            print("🔗 Stored URL for transmit: \(storedUrl ?? "nil"), Using: \(serverUrl)")
+            
+            guard let url = URL(string: serverUrl) else { 
+                print("❌ Invalid PTT server URL: \(serverUrl)")
+                return 
+            }
+            webSocketTask = urlSession.webSocketTask(with: url)
+            webSocketTask?.resume()
+            print("📡 Sent register message for userId: \(userId)")
+            sendMessage(["type": "register", "userId": userId])
+            print("📡 Sent switch message to group: \(groupId)")
+            sendMessage(["type": "switch", "newGroupId": groupId])
+            receiveNextMessage()
+        } else {
+            print("♻️ Reusing existing WebSocket connection")
+            print("📡 Sent switch message to group: \(groupId)")
+            sendMessage(["type": "switch", "newGroupId": groupId])
+        }
+
+        if isAudioSessionActive {
+            print("🎙️ Session already active. Starting to record audio chunks...")
+            startRecordingChunk()
+
+            chunkTimer?.invalidate()
+            chunkTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
+                self?.flushAndContinueRecording()
+            }
+            print("⏱️ Chunk timer started (1.5s interval)")
+        } else {
+            print("⏳ Waiting for Audio Session to activate before recording...")
+        }
+    }
+
+    private func startRecordingChunk() {
+        let tempDir = FileManager.default.temporaryDirectory
+        let fileUrl = tempDir.appendingPathComponent("tx_\(Date().timeIntervalSince1970).m4a")
+        currentRecordFileUrl = fileUrl
+
+        let settings: [String: Any] = [
+            AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
+            AVSampleRateKey: 44100.0,
+            AVNumberOfChannelsKey: 1,
+            AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue
+        ]
+
+        do {
+            audioRecorder = try AVAudioRecorder(url: fileUrl, settings: settings)
+            audioRecorder?.prepareToRecord()
+            audioRecorder?.record()
+            print("🎙️ NativePTTPlayer: Started recording chunk to \(fileUrl.lastPathComponent)")
+        } catch {
+            print("❌ NativePTTPlayer: Failed to start recording - \(error)")
+        }
+    }
+
+    private func flushAndContinueRecording() {
+        guard isTransmitting else { return }
+        audioRecorder?.stop()
+        if let fileUrl = currentRecordFileUrl {
+            sendAudioChunk(fileUrl: fileUrl)
+        }
+        startRecordingChunk()
+    }
+
+    func stopTransmitting() {
+        isTransmitting = false
+        chunkTimer?.invalidate()
+        chunkTimer = nil
+        audioRecorder?.stop()
+        if let fileUrl = currentRecordFileUrl {
+            sendAudioChunk(fileUrl: fileUrl)
+        }
+        audioRecorder = nil
+        currentRecordFileUrl = nil
+        print("🎙️ NativePTTPlayer: Stopped transmitting")
+    }
+
+    private func sendAudioChunk(fileUrl: URL) {
+        guard let groupId = currentGroupId else { return }
+        let userId = UserDefaults.standard.string(forKey: "flutter.ptt_user_id") ?? ""
+        
+        do {
+            let data = try Data(contentsOf: fileUrl)
+            if data.isEmpty { return }
+            
+            let base64String = data.base64EncodedString()
+            let msg: [String: Any] = [
+                "type": "audio",
+                "groupId": groupId,
+                "sender": userId,
+                "chunk": base64String
+            ]
+            
+            if let jsonData = try? JSONSerialization.data(withJSONObject: msg),
+               let str = String(data: jsonData, encoding: .utf8) {
+                webSocketTask?.send(.string(str)) { error in
+                    if let error = error {
+                        print("❌ NativePTTPlayer: Failed to send audio chunk - \(error)")
+                    } else {
+                        print("📤 NativePTTPlayer: Sent audio chunk (\(data.count) bytes)")
+                    }
+                }
+            }
+            
+            // Clean up file
+            try FileManager.default.removeItem(at: fileUrl)
+        } catch {
+            print("❌ NativePTTPlayer: Failed to read/send chunk - \(error)")
+        }
     }
 
     // URLSessionWebSocketDelegate
@@ -234,9 +415,11 @@ extension NativePTTPlayer: AVAudioPlayerDelegate {
             // ✅ Wait 3.5 seconds before ending the transaction. 
             // Because Android streams in 1.5s chunks, we must not close the connection 
             // between chunks or else the voice will cut off mid-sentence!
+            print("⏱️ Audio queue empty, waiting 3.5s before ending session...")
             DispatchQueue.main.async {
                 self.endTransactionTimer?.invalidate()
                 self.endTransactionTimer = Timer.scheduledTimer(withTimeInterval: 3.5, repeats: false) { _ in
+                    print("⏰ Timer expired, posting PTTAudioFinished notification")
                     NotificationCenter.default.post(name: NSNotification.Name("PTTAudioFinished"), object: nil)
                 }
             }
@@ -305,8 +488,10 @@ extension NativePTTPlayer: AVAudioPlayerDelegate {
                 print("🛑 Ending PTT Active Remote Participant")
                 manager.setActiveRemoteParticipant(nil, channelUUID: activeUUID, completionHandler: nil)
             }
-            // End any active CallKit call (shown when app was killed)
-            if let uuid = self.activeCallUUID {
+            // ✅ DON'T auto-end CallKit call — let user dismiss or use talk button to reply
+            // Only end it if no action is taken within 45 seconds
+            DispatchQueue.main.asyncAfter(deadline: .now() + 45.0) { [weak self] in
+                guard let self = self, let uuid = self.activeCallUUID else { return }
                 self.endPTTCallKitCall(uuid: uuid)
             }
             // 🔄 Reset the killed session flag so next fresh kill shows the call screen again
@@ -450,7 +635,10 @@ extension NativePTTPlayer: AVAudioPlayerDelegate {
     // This plays audio WITHOUT involving Flutter at all
     let payloadData = payload.dictionaryPayload
     let groupId = payloadData["groupId"] as? String ?? ""
+    
+    // ✅ CRITICAL: Store the groupId so the talk button knows where to send replies
     if !groupId.isEmpty {
+        NativePTTPlayer.shared.currentGroupId = groupId
         NativePTTPlayer.shared.startBackgroundReceive(groupId: groupId)
         // ✅ FIX: On iOS < 16 (PushKit path) there is no PTT framework didActivate callback.
         // We must manually signal the audio session is ready after a short delay
@@ -471,6 +659,11 @@ extension NativePTTPlayer: AVAudioPlayerDelegate {
   // Shows a CallKit incoming-call screen — the ONLY reliable way to wake a force-killed app.
   // Audio plays through NativePTTPlayer immediately; CallKit is auto-ended when audio finishes.
   private func reportPTTCallKitCall(senderName: String, groupId: String) {
+
+    // ✅ CRITICAL: Store the groupId so the talk button knows where to send replies
+    if !groupId.isEmpty {
+        NativePTTPlayer.shared.currentGroupId = groupId
+    }
 
     // 📻 If already in a killed-session (user saw & dismissed the first call screen),
     // ALL subsequent pushes just play audio silently — no new call screen!
@@ -534,8 +727,8 @@ extension NativePTTPlayer: AVAudioPlayerDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
           NativePTTPlayer.shared.sessionDidActivate()
         }
-        // Auto-end after 35s (safety timeout)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 35.0) { [weak self] in
+        // ✅ Extend auto-end timeout to 60s to give user time to reply
+        DispatchQueue.main.asyncAfter(deadline: .now() + 60.0) { [weak self] in
           guard let self = self, let uuid = self.activeCallUUID else { return }
           self.endPTTCallKitCall(uuid: uuid)
         }
@@ -602,12 +795,14 @@ extension NativePTTPlayer: AVAudioPlayerDelegate {
   private func forceSpeakerAfterDisable() {
     let session = AVAudioSession.sharedInstance()
     do {
-      try session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker, .mixWithOthers])
+      // ✅ FIX: Do NOT call setCategory here — that resets the whole AVAudioSession
+      // and can interfere with the Flutter-managed session on iPhone 12 Pro.
+      // Instead, just override the output port. This is a lightweight, non-destructive call.
       try session.setActive(true)
       try session.overrideOutputAudioPort(.speaker)
-      print("🔊 Speaker forced in playAndRecord mode")
+      print("🔊 Speaker output overridden (lightweight, session category preserved)")
     } catch {
-      print("❌ Failed to force speaker: \(error)")
+      print("❌ Failed to override speaker port: \(error)")
     }
   }
 
@@ -741,30 +936,39 @@ extension AppDelegate: PTChannelManagerDelegate, PTChannelRestorationDelegate {
 
         let groupId = pushPayload["groupId"] as? String ?? ""
         let senderName = pushPayload["senderName"] as? String ?? "Walkie-Talkie"
+        let senderId = pushPayload["senderId"] as? String ?? ""
+        
+        // ✅ Decide the correct group to reply to:
+        // If groupId == our own ID, it's a 1-on-1 message, so we must reply to the senderId.
+        // Otherwise, it's a group chat, so we reply to the same groupId.
+        let myUserId = UserDefaults.standard.string(forKey: "flutter.ptt_user_id") ?? ""
+        let replyGroupId = (groupId == myUserId && !senderId.isEmpty) ? senderId : groupId
+        NativePTTPlayer.shared.currentGroupId = replyGroupId // ✅ Cache for replying
 
-        if !hasBeenInForeground {
-            // 💥 App was FORCE-KILLED and woken by this push.
-            // Use CallKit to get extra background execution time and show the call screen.
-            print("📱 App was killed — showing CallKit call screen for PTT")
-            reportPTTCallKitCall(senderName: senderName, groupId: groupId)
-        } else {
-            // 🤟 App was in BACKGROUND (user pressed Home) — silent PTT, no call screen.
-            print("🤟 App was backgrounded — silent PTT playback")
-            if !groupId.isEmpty {
-                NativePTTPlayer.shared.startBackgroundReceive(groupId: groupId)
-                // ✅ FIX: The PTT framework's didActivate fires the session,
-                // but we add a short delay fallback in case it fired before WS connected.
-                // The real session activation comes from channelManager(_:didActivate:) below.
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                    // Only force-start if the PTT framework hasn't already activated
-                    NativePTTPlayer.shared.sessionDidActivate()
+        // ✅ Start background audio playback
+        // The PTT framework (iOS 16+) wakes the app on its own. CallKit is NOT needed.
+        // Whether the app was killed or backgrounded, just connect and play audio.
+        print("🔊 PTT push — will play audio and show system UI")
+        
+        DispatchQueue.main.async {
+            if UIApplication.shared.applicationState == .active {
+                print("🛑 App is in FOREGROUND — skipping NativePTTPlayer to avoid double audio!")
+            } else {
+                if !groupId.isEmpty {
+                    NativePTTPlayer.shared.startBackgroundReceive(groupId: groupId)
+                    // Give the WebSocket 0.5s to connect before force-starting the queue.
+                    // The real activation also comes from channelManager(_:didActivate:) below.
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                        NativePTTPlayer.shared.sessionDidActivate()
+                    }
                 }
             }
         }
 
-        // Always notify Flutter (with UserDefaults fallback)
+        // Notify Flutter (with UserDefaults fallback for when Flutter isn't ready)
         sendVoIPPushToFlutter(pushPayload)
 
+        // ✅ Return activeRemoteParticipant to keep PTT session alive and show system UI
         let participant = PTParticipant(name: senderName, image: nil)
         return .activeRemoteParticipant(participant)
     }
@@ -789,16 +993,51 @@ extension AppDelegate: PTChannelManagerDelegate, PTChannelRestorationDelegate {
     }
     
     func channelManager(_ channelManager: PTChannelManager, didLeaveChannel channelUUID: UUID, reason: PTChannelLeaveReason) {
-        print("🎙️ Left PTT Channel")
+        print("🎙️ Left PTT Channel. Rejoining silently to stay ready for next push in 2 seconds...")
+        let descriptor = PTChannelDescriptor(name: "Walkie-Talkie", image: nil)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+            channelManager.requestJoinChannel(channelUUID: channelUUID, descriptor: descriptor)
+        }
     }
     
     func channelManager(_ channelManager: PTChannelManager, channelUUID: UUID, didBeginTransmittingFrom source: PTChannelTransmitRequestSource) {
-        print("🎙️ Began Transmitting")
+        print("🎙️ Began Transmitting (source: \(source.rawValue))")
+        
+        // ✅ Get the groupId from either cached value or try to retrieve from pending push
+        var groupId = NativePTTPlayer.shared.currentGroupId
+        print("📍 Current groupId in memory: \(groupId ?? "nil")")
+        
+        if groupId == nil || groupId!.isEmpty {
+            // ⚠️ Fallback: Try to get groupId from the pending VoIP payload
+            if let payload = UserDefaults.standard.dictionary(forKey: "pending_voip_payload"),
+               let gId = payload["groupId"] as? String {
+                groupId = gId
+                NativePTTPlayer.shared.currentGroupId = gId
+                print("🔄 Retrieved groupId from pending payload: \(gId)")
+            } else {
+                print("⚠️ No pending payload found in UserDefaults")
+            }
+        }
+        
+        if let groupId = groupId, !groupId.isEmpty {
+            print("✅ Starting transmission to group: \(groupId)")
+            NativePTTPlayer.shared.startTransmitting(groupId: groupId)
+        } else {
+            print("❌ Cannot transmit: No groupId available!")
+            print("💡 Tip: Make sure a PTT message was received before trying to reply")
+        }
     }
     
     func channelManager(_ channelManager: PTChannelManager, channelUUID: UUID, didEndTransmittingFrom source: PTChannelTransmitRequestSource) {
-        print("🎙️ Ended Transmitting")
+        print("🎙️ Ended Transmitting (source: \(source.rawValue))")
+        NativePTTPlayer.shared.stopTransmitting()
+        
+        // Hide Walkie-Talkie UI immediately after user releases Talk button
+        // print("🛑 Hiding Walkie-Talkie UI by leaving channel...")
+        // channelManager.leaveChannel(channelUUID: channelUUID)
     }
+    
+    // Duplicate didLeaveChannel removed.
     
     func channelManager(_ channelManager: PTChannelManager, failedToJoinChannel channelUUID: UUID, error: Error) {
         print("❌ Failed to join PTT Channel: \(error)")

@@ -376,8 +376,10 @@ Widget build(BuildContext context) {
 
      //   await AgoraController().LeaveChannel();
       _animationController.forward(); // Animate when receiver is selected
+      // ✅ FIX: joinGroup BEFORE startRecording so the first chunk goes to the right group.
+      // Previously joinGroup was called AFTER, causing first press to send to wrong group (self).
+      WebSocketPTTController().joinGroup(channelID!);
       await WebSocketPTTController().startRecording();
-       WebSocketPTTController().joinGroup(channelID!);
       
             if (await Vibration.hasVibrator() ?? false) {
               if (await Vibration.hasAmplitudeControl() ?? false) {
@@ -395,8 +397,8 @@ Widget build(BuildContext context) {
                   await WebSocketPTTController().stopRecording();
                   await WebSocketPTTController().sendAudio();
   _animationController.reverse(); // Only reverse if it was animated
-    
-       WebSocketPTTController().joinGroup(currentUser.userId);
+  // ✅ FIX: Removed joinGroup(currentUser.userId) here — switching the group back to self
+  // was causing the receiver to miss audio chunks still in-flight.
        
         
         //    final User? Pttcaller = await UserApi.getUser(channelID!);
@@ -431,7 +433,7 @@ Widget build(BuildContext context) {
       
                   await WebSocketPTTController().stopRecording();
                   await WebSocketPTTController().sendAudio();
-      WebSocketPTTController().joinGroup(currentUser.userId);
+      // ✅ FIX: Removed joinGroup(currentUser.userId) on cancel — same race condition fix
       //  print(currentUser.userId);
             },
             child: Center(

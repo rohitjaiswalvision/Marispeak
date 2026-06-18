@@ -1691,7 +1691,9 @@ Positioned(
           }
         }
 
-        await startSession();
+        // ✅ FIX: Removed startSession() — it was calling AudioSession.configure(.voiceChat) which
+        // undoes our playAndRecord+defaultToSpeaker fix and routes audio to earpiece silently.
+        // ✅ FIX: joinGroup BEFORE startRecording so the first chunk targets the correct group.
         WebSocketPTTController().joinGroup(channelID);
         await WebSocketPTTController().startRecording();
 
@@ -1730,16 +1732,17 @@ Positioned(
           if (_seconds >= 2) {
             await WebSocketPTTController().stopRecording();
             await WebSocketPTTController().sendAudio();
-            switchToPlaybackMode();
+            // ✅ FIX: Removed switchToPlaybackMode() — it was reconfiguring AudioSession to .music()
+            // which has no defaultToSpeaker, routing incoming reply audio through the earpiece.
 
-            Get.snackbar(
-              "Notification Sent!",
-              "PTT Sent Success!",
-              snackPosition: SnackPosition.TOP,
-              duration: Duration(seconds: 2),
-              backgroundColor: const Color.fromARGB(255, 41, 164, 246),
-              colorText: Colors.white,
-            );
+            // Get.snackbar(
+            //   "Notification Sent!",
+            //   "PTT Sent Success!",
+            //   snackPosition: SnackPosition.TOP,
+            //   duration: Duration(seconds: 2),
+            //   backgroundColor: const Color.fromARGB(255, 41, 164, 246),
+            //   colorText: Colors.white,
+            // );
 
             if (isGroupChat) {
               final groupController = Get.find<GroupController>();

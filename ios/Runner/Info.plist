@@ -122,6 +122,6 @@
 	<key>UIViewControllerBasedStatusBarAppearance</key>
 	<false/>
 	<key>aps-environment</key>
-	<string>production</string>
+	<string>development</string>
 </dict>
 </plist>

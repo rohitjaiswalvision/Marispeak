@@ -8,6 +8,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:just_audio/just_audio.dart';
+import 'package:marispeaks/config/environment.dart';
 import 'package:marispeaks/screens/home/CustomBottomSection.dart';
 import 'package:marispeaks/services/voip_service.dart';
 import 'package:record/record.dart';
@@ -46,11 +47,10 @@ class WebSocketPTTController with WidgetsBindingObserver {
   bool isRecording = false;
   bool isConnected = false;
 
-  // ✅ Voice-optimized codec config — 4× smaller than previous 44100/128kbps
   static const RecordConfig _voiceConfig = RecordConfig(
     encoder: AudioEncoder.aacLc,
-    sampleRate: 16000, // was 44100 — voice-only needs 16kHz
-    bitRate: 32000,    // was 128000 — 32kbps is plenty for voice
+    sampleRate: 44100, // Reverted to 44100. 16kHz can crash iOS AVAudioEngine
+    bitRate: 128000, // Reverted to 128000
     numChannels: 1,
   );
 
@@ -63,10 +63,40 @@ class WebSocketPTTController with WidgetsBindingObserver {
     await Permission.microphone.request();
 
     final session = await AudioSession.instance;
-    await session.configure(const AudioSessionConfiguration.speech());
+    // ✅ FIX: Do NOT use AudioSessionConfiguration.speech() — it sets .voiceChat mode
+    // which enables AGC + noise suppression and routes output to the EARPIECE on iPhone 12 Pro.
+    // Use .playAndRecord with .defaultToSpeaker so audio always comes from the loud speaker.
+    await session.configure(AudioSessionConfiguration(
+      avAudioSessionCategory: AVAudioSessionCategory.playAndRecord,
+      // ✅ Use | operator to combine bitmask options (NOT named constructor params)
+      avAudioSessionCategoryOptions:
+          AVAudioSessionCategoryOptions.defaultToSpeaker |
+              AVAudioSessionCategoryOptions.mixWithOthers |
+              AVAudioSessionCategoryOptions.allowBluetooth,
+      avAudioSessionMode:
+          AVAudioSessionMode.defaultMode, // ✅ correct enum value
+      avAudioSessionRouteSharingPolicy:
+          AVAudioSessionRouteSharingPolicy.defaultPolicy,
+      avAudioSessionSetActiveOptions:
+          AVAudioSessionSetActiveOptions.none, // ✅ use .none constant
+      androidAudioAttributes: const AndroidAudioAttributes(
+        contentType: AndroidAudioContentType.music,
+        flags: AndroidAudioFlags.none,
+        usage: AndroidAudioUsage.media,
+      ),
+      androidAudioFocusGainType: AndroidAudioFocusGainType.gain,
+      androidWillPauseWhenDucked: false,
+    ));
     await session.setActive(true);
 
     if (Platform.isIOS) forceSpeakerOnIOS();
+
+    // ✅ FIX: When iOS issues a refreshed PTT token, send it to the server
+    // immediately so the server always has the latest token for push delivery.
+    VoIPService().onVoIPTokenRefreshed = (newToken) {
+      debugPrint('📲 Token refreshed — sending to server immediately');
+      _sendVoIPTokenToServer();
+    };
 
     startNetworkMonitor();
 
@@ -122,9 +152,14 @@ class WebSocketPTTController with WidgetsBindingObserver {
     } catch (_) {}
 
     try {
-      _channel = WebSocketChannel.connect(
-          Uri.parse("wss://ptt.visionvivante.in") // 🔧 PRODUCTION
-          );
+      // ✅ Use environment-based server URL
+      final serverUrl = Environment.current.pttServerUrl;
+
+      if (Environment.current.enableLogging) {
+        debugPrint("🔌 Connecting to PTT server: $serverUrl");
+      }
+
+      _channel = WebSocketChannel.connect(Uri.parse(serverUrl));
 
       _channel!.sink.add(jsonEncode({
         "type": "register",
@@ -133,14 +168,12 @@ class WebSocketPTTController with WidgetsBindingObserver {
 
       // ✅ Send our VoIP push token to the server so it can wake us when offline
       if (Platform.isIOS) {
-        final voipToken = VoIPService().voipToken;
-        if (voipToken != null) {
-          _channel!.sink.add(jsonEncode({
-            "type": "voip_token",
-            "token": voipToken,
-          }));
-          debugPrint("📲 Sent VoIP token to server");
-        }
+        _sendVoIPTokenToServer();
+        // ✅ FIX: Retry after 2s in case the PTT framework delivers the token
+        // AFTER the WebSocket connects (common on first launch)
+        Future.delayed(const Duration(seconds: 2), () {
+          if (isConnected) _sendVoIPTokenToServer();
+        });
       }
 
       _wsSubscription = _channel!.stream.listen(
@@ -159,6 +192,20 @@ class WebSocketPTTController with WidgetsBindingObserver {
     } catch (e) {
       debugPrint("❌ Failed connect: $e");
       _onDisconnect();
+    }
+  }
+
+  /// Sends VoIP token to server if we have one and are connected.
+  void _sendVoIPTokenToServer() {
+    final voipToken = VoIPService().voipToken;
+    if (voipToken != null && _channel != null) {
+      try {
+        _channel!.sink.add(jsonEncode({
+          "type": "voip_token",
+          "token": voipToken,
+        }));
+        debugPrint("📲 Sent VoIP token to server");
+      } catch (_) {}
     }
   }
 
@@ -185,12 +232,17 @@ class WebSocketPTTController with WidgetsBindingObserver {
     final data = jsonDecode(event);
 
     if (data["type"] == "audio") {
+      if (data["sender"] == senderId) {
+        debugPrint("🔇 Ignoring our own audio chunk");
+        return;
+      }
+
       final bytes = base64Decode(data["chunk"]);
       debugPrint("📦 Flutter received ${bytes.length} bytes of audio");
-      
+
       final dir = await getApplicationDocumentsDirectory();
       final path =
-          "${dir.path}/rx_${DateTime.now().millisecondsSinceEpoch}.aac";
+          "${dir.path}/rx_${DateTime.now().millisecondsSinceEpoch}.m4a";
       final file = File(path);
       await file.writeAsBytes(bytes, flush: true);
 
@@ -216,22 +268,34 @@ class WebSocketPTTController with WidgetsBindingObserver {
     final path = _playQueue.removeFirst();
 
     try {
-      if (Platform.isIOS) forceSpeakerOnIOS();
+      // ✅ FIX: Re-assert speaker output before every chunk on iOS.
+      // iPhone 12 Pro silently reverts the audio route to earpiece between chunks.
+      // Calling overrideOutputAudioPort(.speaker) is lightweight and safe — it does NOT
+      // reset the AVAudioSession, it just overrides the current output route.
+      if (Platform.isIOS) {
+        try {
+          await platform.invokeMethod("forceSpeaker");
+        } catch (_) {}
+      }
 
+      await _player.setVolume(1.0); // ✅ Always play at max volume
       await _player.setAudioSource(AudioSource.uri(Uri.file(path)));
       await _player.play();
 
       // Wait until this chunk finishes before playing the next
       await _player.playerStateStream.firstWhere(
-        (s) => s.processingState == ProcessingState.completed ||
-               s.processingState == ProcessingState.idle,
+        (s) =>
+            s.processingState == ProcessingState.completed ||
+            s.processingState == ProcessingState.idle,
       );
     } catch (e, stack) {
       debugPrint("❌ Playback error: $e");
       debugPrint(stack.toString());
     } finally {
       // ✅ Always clean up temp files to avoid storage bloat
-      try { await File(path).delete(); } catch (_) {}
+      try {
+        await File(path).delete();
+      } catch (_) {}
     }
 
     // Play next chunk
@@ -266,7 +330,7 @@ class WebSocketPTTController with WidgetsBindingObserver {
   /// Start recording into a new temp file
   Future<void> _startNewChunk() async {
     final dir = await getApplicationDocumentsDirectory();
-    _filePath = "${dir.path}/tx_${DateTime.now().millisecondsSinceEpoch}.aac";
+    _filePath = "${dir.path}/tx_${DateTime.now().millisecondsSinceEpoch}.m4a";
     await _recorder.start(_voiceConfig, path: _filePath!);
   }
 
@@ -314,18 +378,26 @@ class WebSocketPTTController with WidgetsBindingObserver {
     }
 
     // ✅ Clean up sent file immediately
-    try { await file.delete(); } catch (_) {}
+    try {
+      await file.delete();
+    } catch (_) {}
   }
 
   // ------------------------------------------------------------
   // GROUPS
   // ------------------------------------------------------------
-  void joinGroup(String id) {
-    groupId = id.trim();
-    _channel?.sink.add(jsonEncode({
-      "type": "switch",
-      "newGroupId": groupId,
-    }));
+  void joinGroup(String newGroupId) {
+    groupId = newGroupId.trim();
+    if (isConnected && _channel != null) {
+      try {
+        _channel!.sink.add(jsonEncode({
+          "type": "switch",
+          "newGroupId": groupId,
+        }));
+      } catch (e) {
+        debugPrint("❌ Failed to join group (socket closed): $e");
+      }
+    }
     debugPrint("👥 Joined group $groupId");
   }
 
@@ -371,18 +443,19 @@ class WebSocketPTTController with WidgetsBindingObserver {
   // ------------------------------------------------------------
   bool _isHandlingPush = false;
 
-  void handlePushConnect(String id) async {
+  void handlePushConnect(String groupId, String userId) async {
     if (Platform.isIOS) {
       bool inBackground = await VoIPService().isAppInBackground();
       if (inBackground) {
-        debugPrint("🟡 Ignoring VoIP push in Flutter because iOS app is in background. Swift handles it!");
+        debugPrint(
+            "🟡 Ignoring VoIP push in Flutter because iOS app is in background. Swift handles it!");
         return;
       }
     }
-    
+
     _isHandlingPush = true;
-    connect(id);
-    joinGroup(id);
+    connect(userId);
+    joinGroup(groupId);
     Future.delayed(const Duration(seconds: 10), () {
       _isHandlingPush = false;
     });
@@ -394,7 +467,8 @@ class WebSocketPTTController with WidgetsBindingObserver {
         state == AppLifecycleState.inactive ||
         state == AppLifecycleState.detached) {
       if (isRecording) {
-        debugPrint("🛑 App backgrounded while recording! Stopping record timer.");
+        debugPrint(
+            "🛑 App backgrounded while recording! Stopping record timer.");
         await stopRecording();
       }
 
@@ -416,7 +490,8 @@ class WebSocketPTTController with WidgetsBindingObserver {
         // If we are, DO NOT connect Flutter's WebSocket! Let Swift handle the audio natively!
         bool inBackground = await VoIPService().isAppInBackground();
         if (inBackground) {
-          debugPrint("🟡 App 'resumed' by iOS in background (PushKit) — NOT connecting Flutter WebSocket");
+          debugPrint(
+              "🟡 App 'resumed' by iOS in background (PushKit) — NOT connecting Flutter WebSocket");
           return;
         }
       }

@@ -17,6 +17,7 @@ class VoIPService {
   // Callback that gets called when a VoIP push arrives while app is
   // in background/locked — use this to trigger PTT audio playback
   Function(Map<String, String>)? onVoIPPushReceived;
+  Function(String?)? onVoIPTokenRefreshed; // ✅ NEW: fires when iOS issues a fresh token
   Function()? onCallAnswered;
   Function()? onCallEnded;
 
@@ -77,8 +78,9 @@ class VoIPService {
         // iOS sent us a new/updated VoIP push token
         _voipToken = call.arguments as String?;
         debugPrint('📲 New VoIP Token received: $_voipToken');
-        // TODO: Send this token to your Railway backend so it knows
-        // which APNs VoIP token to push to when a PTT message arrives.
+        // ✅ FIX: Immediately notify the PTT controller so it forwards the
+        // token to the server. Previously the token arrived but was never sent.
+        onVoIPTokenRefreshed?.call(_voipToken);
         break;
 
       case 'onVoIPPush':

@@ -19,10 +19,23 @@ async function testPush() {
 
   const deviceToken = "787df0edc2492f192e72ddea2162576b9cae78909738d8a3c9b0089e35f292aa"; // From user's log
 
+  import crypto from 'crypto';
+  
+  function makeChannelUUID(groupId) {
+    const md5 = crypto.createHash('md5').update(groupId || "").digest('hex');
+    return `${md5.substring(0,8)}-${md5.substring(8,12)}-${md5.substring(12,16)}-${md5.substring(16,20)}-${md5.substring(20,32)}`.toUpperCase();
+  }
+
+  const channelUUID = makeChannelUUID("ajaw9LhcwUSp5tyoVXorVYV8N473");
+
   const note = new apn.Notification();
   note.expiry = 0; 
   note.priority = 10;
-  note.payload = {
+  note.rawPayload = {
+    aps: {
+      "channel-uuid": channelUUID,
+      "active_remote_participant": "Agent Test"
+    },
     type: "ptt",
     senderName: "Agent Test",
     groupId: "ajaw9LhcwUSp5tyoVXorVYV8N473",

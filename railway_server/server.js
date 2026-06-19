@@ -32,7 +32,7 @@ function initAPNs() {
       },
       // ✅ TRUE for TestFlight and App Store (production APNs tokens)
       // Set to FALSE only when testing directly via Xcode USB cable (sandbox tokens)
-      production: false,
+      production: true,
     };
 
     apnProvider = new apn.Provider(options);
@@ -111,6 +111,7 @@ wss.on("connection", (ws) => {
       };
 
       clients.set(userId, newClient);
+      newClient.lastVoipPushAt = 0;
       console.log(`✅ Registered: ${userId}`);
 
       // Send any pending audio that was queued while offline
@@ -176,7 +177,16 @@ wss.on("connection", (ws) => {
             console.log(`📲 Client ${uid} is offline — sending VoIP push`);
             client.pendingAudio = client.pendingAudio || [];
             client.pendingAudio.push({ chunk, sender: userId });
-            await sendVoIPPush(client.voipToken, senderName, targetGroupId, userId);
+            // One push per offline session — extra chunks queue in pendingAudio
+            const now = Date.now();
+            const lastPush = client.lastVoipPushAt || 0;
+            // Lowered rate limit to 2 seconds to allow back-to-back testing without dropping pushes
+            if (now - lastPush > 2000) {
+              client.lastVoipPushAt = now;
+              await sendVoIPPush(client.voipToken, senderName, targetGroupId, userId);
+            } else {
+              console.log(`📦 Queued audio for ${uid} (VoIP push already sent)`);
+            }
           } else {
             console.log(`⚠️ Client ${uid} is offline but has no VoIP token`);
           }

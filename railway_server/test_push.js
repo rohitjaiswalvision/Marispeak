@@ -1,6 +1,7 @@
 import apn from "@parse/node-apn";
 import path from "path";
 import { fileURLToPath } from 'url';
+import crypto from 'crypto';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -18,15 +19,13 @@ async function testPush() {
   const apnProvider = new apn.Provider(options);
 
   const deviceToken = "787df0edc2492f192e72ddea2162576b9cae78909738d8a3c9b0089e35f292aa"; // From user's log
-
-  import crypto from 'crypto';
   
   function makeChannelUUID(groupId) {
     const md5 = crypto.createHash('md5').update(groupId || "").digest('hex');
     return `${md5.substring(0,8)}-${md5.substring(8,12)}-${md5.substring(12,16)}-${md5.substring(16,20)}-${md5.substring(20,32)}`.toUpperCase();
   }
 
-  const channelUUID = makeChannelUUID("ajaw9LhcwUSp5tyoVXorVYV8N473");
+  const channelUUID = makeChannelUUID("ajaw9LhcwUSp5tyoVXorVYV8N473_bvzrZKSKA4RVEXFjJaEHfIWUo2O2");
 
   const note = new apn.Notification();
   note.expiry = 0; 

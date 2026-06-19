@@ -30,7 +30,7 @@ class Environment {
 
   // 🔧 CHANGE THIS TO SWITCH ENVIRONMENTS
   // ⚠️  IMPORTANT: Set to production before releasing to app stores!
-  static Environment current = development; // <-- Change this line
+  static Environment current = production; // <-- Change this line
 
   // ============================================
   // ENVIRONMENT CONFIGURATIONS
@@ -43,7 +43,8 @@ class Environment {
   static const Environment development = Environment(
     type: EnvironmentType.development,
     name: 'Development',
-    pttServerUrl: 'ws://192.168.3.192:3010', // Local development server (Mac's IP)
+    pttServerUrl:
+        'ws://192.168.3.192:3010', // Local development server (Mac's IP)
     apiBaseUrl: 'https://dev-api.marispeak.com',
     enableLogging: true,
     enableDebugFeatures: true,

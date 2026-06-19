@@ -20,6 +20,7 @@ import 'package:marispeaks/screens/home/CustomBottomSection.dart';
 import 'package:marispeaks/screens/home/MainScreenUI.dart';
 import 'package:marispeaks/screens/messages/message_screen.dart';
 import 'package:marispeaks/screens/ptt/agora_controller.dart';
+import 'package:marispeaks/screens/ptt/websocket_ptt_controller.dart';
 import 'package:marispeaks/tabs/groups/controllers/group_controller.dart';
 import 'package:get/get.dart';
 
@@ -87,6 +88,27 @@ class MessageController extends GetxController {
     currentOpenChatId = user?.userId;
   }
 
+  _subscribePttChannel();
+  }
+
+  void _subscribePttChannel() {
+    final myId = AuthController.instance.currentUser?.userId;
+    if (myId == null) return;
+
+    final String channel;
+    if (isGroup) {
+      channel = selectedGroup?.groupId ??
+          _groupController.selectedGroup.value?.groupId ??
+          '';
+    } else if (user != null) {
+      channel = WebSocketPTTController.sharedChannelId(myId, user!.userId);
+    } else {
+      return;
+    }
+
+    if (channel.isNotEmpty) {
+      WebSocketPTTController().joinGroup(channel);
+    }
   }
 
   @override

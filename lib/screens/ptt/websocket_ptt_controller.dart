@@ -3,6 +3,8 @@ import 'dart:collection';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:crypto/crypto.dart';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
@@ -43,9 +45,18 @@ class WebSocketPTTController with WidgetsBindingObserver {
 
   String? senderId;
   String? groupId;
+  String? _activeChatGroupId;
   String? _filePath;
   bool isRecording = false;
   bool isConnected = false;
+
+  static const _activeGroupKey = 'ptt_active_group_id';
+
+  /// Stable channel id for 1-to-1 PTT (both users must use the same value).
+  static String sharedChannelId(String userId1, String userId2) {
+    final ids = [userId1, userId2]..sort();
+    return ids.join('_');
+  }
 
   static const RecordConfig _voiceConfig = RecordConfig(
     encoder: AudioEncoder.aacLc,
@@ -142,14 +153,19 @@ class WebSocketPTTController with WidgetsBindingObserver {
     if (isConnected) return;
 
     senderId = uid.trim();
-    groupId = uid.trim();
 
     // ✅ Persist userId to UserDefaults (via SharedPreferences) so native Swift
     // can read it when the app is locked and connect WebSocket natively
     try {
       final prefs = await SharedPreferences.getInstance();
       await prefs.setString('ptt_user_id', senderId!);
+      _activeChatGroupId ??= prefs.getString(_activeGroupKey);
     } catch (_) {}
+
+    // Re-join the active chat channel after reconnect — not our own userId
+    groupId = (_activeChatGroupId != null && _activeChatGroupId!.isNotEmpty)
+        ? _activeChatGroupId!
+        : senderId;
 
     try {
       // ✅ Use environment-based server URL
@@ -241,8 +257,9 @@ class WebSocketPTTController with WidgetsBindingObserver {
       debugPrint("📦 Flutter received ${bytes.length} bytes of audio");
 
       final dir = await getApplicationDocumentsDirectory();
+      final uniqueId = DateTime.now().microsecondsSinceEpoch; // Use microseconds instead of milliseconds
       final path =
-          "${dir.path}/rx_${DateTime.now().millisecondsSinceEpoch}.m4a";
+          "${dir.path}/rx_${uniqueId}.m4a";
       final file = File(path);
       await file.writeAsBytes(bytes, flush: true);
 
@@ -269,15 +286,13 @@ class WebSocketPTTController with WidgetsBindingObserver {
 
     try {
       // ✅ FIX: Re-assert speaker output before every chunk on iOS.
-      // iPhone 12 Pro silently reverts the audio route to earpiece between chunks.
-      // Calling overrideOutputAudioPort(.speaker) is lightweight and safe — it does NOT
-      // reset the AVAudioSession, it just overrides the current output route.
       if (Platform.isIOS) {
         try {
           await platform.invokeMethod("forceSpeaker");
         } catch (_) {}
       }
 
+      debugPrint("🔊 Flutter playing audio chunk: $path");
       await _player.setVolume(1.0); // ✅ Always play at max volume
       await _player.setAudioSource(AudioSource.uri(Uri.file(path)));
       await _player.play();
@@ -288,6 +303,7 @@ class WebSocketPTTController with WidgetsBindingObserver {
             s.processingState == ProcessingState.completed ||
             s.processingState == ProcessingState.idle,
       );
+      debugPrint("✅ Flutter finished playing audio chunk");
     } catch (e, stack) {
       debugPrint("❌ Playback error: $e");
       debugPrint(stack.toString());
@@ -358,15 +374,39 @@ class WebSocketPTTController with WidgetsBindingObserver {
   }
 
   Future<void> _sendFile(String path) async {
-    if (groupId == null || !isConnected) return;
+    if (groupId == null) return;
+
+    // ✅ FIX: Wait up to 3 seconds for WebSocket to connect before dropping the chunk.
+    // This fixes the "first message doesn't send" bug if the user presses the button
+    // immediately after opening the app before the socket finishes connecting.
+    if (!isConnected || _channel == null) {
+      debugPrint("⏳ Waiting for WebSocket to connect before sending audio...");
+      for (int i = 0; i < 15; i++) {
+        if (isConnected && _channel != null) break;
+        await Future.delayed(const Duration(milliseconds: 200));
+      }
+    }
+
+    if (!isConnected || _channel == null) {
+      debugPrint("❌ Still not connected, dropping chunk.");
+      return;
+    }
+
     final file = File(path);
     if (!await file.exists()) return;
     final bytes = await file.readAsBytes();
     if (bytes.isEmpty) return;
 
+    // Generate MD5 channelUUID
+    final md5Bytes = md5.convert(utf8.encode(groupId ?? ""));
+    final hex = md5Bytes.toString().toUpperCase();
+    final channelUUID = "${hex.substring(0, 8)}-${hex.substring(8, 12)}-${hex.substring(12, 16)}-${hex.substring(16, 20)}-${hex.substring(20, 32)}";
+    debugPrint("📤 Sending audio with channelUUID: $channelUUID");
+
     final msg = jsonEncode({
       "type": "audio",
       "groupId": groupId,
+      "channelUUID": channelUUID,
       "sender": senderId,
       "chunk": base64Encode(bytes),
     });
@@ -387,7 +427,15 @@ class WebSocketPTTController with WidgetsBindingObserver {
   // GROUPS
   // ------------------------------------------------------------
   void joinGroup(String newGroupId) {
-    groupId = newGroupId.trim();
+    final id = newGroupId.trim();
+    if (id.isEmpty) return;
+
+    groupId = id;
+    _activeChatGroupId = id;
+    SharedPreferences.getInstance().then((prefs) {
+      prefs.setString(_activeGroupKey, id);
+    }).catchError((_) {});
+
     if (isConnected && _channel != null) {
       try {
         _channel!.sink.add(jsonEncode({
@@ -398,6 +446,13 @@ class WebSocketPTTController with WidgetsBindingObserver {
         debugPrint("❌ Failed to join group (socket closed): $e");
       }
     }
+    
+    // ✅ Tell iOS PushToTalk framework to join the correct Channel UUID
+    if (Platform.isIOS) {
+      const pttVoipChannel = MethodChannel("ptt/voip");
+      pttVoipChannel.invokeMethod("joinChannel", {"groupId": groupId}).catchError((_) {});
+    }
+
     debugPrint("👥 Joined group $groupId");
   }
 
@@ -498,7 +553,11 @@ class WebSocketPTTController with WidgetsBindingObserver {
 
       debugPrint("🟢 App resumed, reconnecting WebSocket");
       if (senderId != null) {
-        connect(senderId!);
+        await connect(senderId!);
+        // connect() re-joins _activeChatGroupId; call again if chat opened while suspended
+        if (_activeChatGroupId != null && _activeChatGroupId!.isNotEmpty) {
+          joinGroup(_activeChatGroupId!);
+        }
       }
     }
   }

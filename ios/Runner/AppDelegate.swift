@@ -7,6 +7,7 @@ import PushKit
 import CallKit
 import PushToTalk
 import Foundation
+import CryptoKit
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - NativePTTPlayer
@@ -439,6 +440,7 @@ extension NativePTTPlayer: AVAudioPlayerDelegate {
   var callController = CXCallController()
   var activeCallUUID: UUID?
   var channelManager: Any? // PTChannelManager on iOS 16+
+  var pendingJoinChannelUUID: UUID? // Used to deduplicate rapid joinChannel calls
 
   // 🔑 Tracks if the app has ever been in the foreground during this process lifetime.
   // false = app was just woken from killed state by a VoIP/PTT push
@@ -452,15 +454,12 @@ extension NativePTTPlayer: AVAudioPlayerDelegate {
   
   // ✅ Helper function to generate UUID from groupId
   func channelUUIDFromGroupId(_ groupId: String) -> UUID {
-    // Generate a consistent UUID from the groupId string
-    // Use UUID v5 (name-based) for deterministic generation
-    let namespace = UUID(uuidString: "6ba7b810-9dad-11d1-80b4-00c04fd430c8")! // DNS namespace
-    
-    // Simple hash-based UUID generation
-    let hash = groupId.hash
-    let uuidString = String(format: "%08x-0000-0000-0000-000000000000", abs(hash))
-    
-    return UUID(uuidString: uuidString) ?? UUID(uuidString: "00000000-0000-0000-0000-000000000000")!
+    let md5 = Insecure.MD5.hash(data: Data(groupId.utf8))
+    let hex = md5.compactMap { String(format: "%02x", $0) }.joined()
+    let formatted = "\(hex.prefix(8))-\(hex.dropFirst(8).prefix(4))-\(hex.dropFirst(12).prefix(4))-\(hex.dropFirst(16).prefix(4))-\(hex.dropFirst(20).prefix(12))".uppercased()
+    let finalUUID = UUID(uuidString: formatted) ?? UUID(uuidString: "00000000-0000-0000-0000-000000000000")!
+    print("📱 Channel UUID: \(groupId) -> \(finalUUID)")
+    return finalUUID
   }
 
   override func applicationDidBecomeActive(_ application: UIApplication) {
@@ -520,16 +519,10 @@ extension NativePTTPlayer: AVAudioPlayerDelegate {
             } else if let manager = manager {
                 self.channelManager = manager
                 
-                // ✅ Use a default channel UUID for initial registration
-                // This will be dynamically switched when a chat is opened
-                let defaultChannelUUID = UUID(uuidString: "00000000-0000-0000-0000-000000000000")!
-                let descriptor = PTChannelDescriptor(name: "Walkie-Talkie", image: nil)
-                
                 if let activeUUID = manager.activeChannelUUID {
                     print("✅ Already joined PTT Channel: \(activeUUID)")
                 } else {
-                    print("📻 Joining default PTT channel...")
-                    manager.requestJoinChannel(channelUUID: defaultChannelUUID, descriptor: descriptor)
+                    print("📻 Ready to join PTT channels dynamically.")
                 }
             }
         }
@@ -575,6 +568,46 @@ extension NativePTTPlayer: AVAudioPlayerDelegate {
           // ✅ Tell Flutter if the app is truly in the background or not
           let state = UIApplication.shared.applicationState
           result(state == .background || state == .inactive)
+        } else if call.method == "joinChannel" {
+          // ✅ Tell the iOS PushToTalk framework which channel we are active in
+          if let args = call.arguments as? [String: Any], let groupId = args["groupId"] as? String {
+              let newUUID = self.channelUUIDFromGroupId(groupId)
+              
+              if #available(iOS 16.0, *) {
+                  let descriptor = PTChannelDescriptor(name: "Walkie-Talkie", image: nil)
+                  
+                  if let manager = self.channelManager as? PTChannelManager {
+                      // Deduplicate rapid rapid calls from Flutter that happen before the framework updates
+                      if self.pendingJoinChannelUUID == newUUID {
+                          print("✅ Already in the process of joining: \(newUUID)")
+                          result(nil)
+                          return
+                      }
+                      
+                      self.pendingJoinChannelUUID = newUUID
+
+                      // Apple PushToTalk daemon has a known bug where it keeps a "zombie" lock on a channel
+                      // from a previous app session, even if `activeChannelUUID` is locally nil!
+                      // To fix Code=2 (channelLimitReached), we must FORCE the daemon to drop any channel it holds.
+                      
+                      if let oldUUID = manager.activeChannelUUID {
+                          manager.leaveChannel(channelUUID: oldUUID)
+                      }
+                      // ALWAYS forcefully leave the newUUID as well just in case the daemon holds a zombie lock on it
+                      manager.leaveChannel(channelUUID: newUUID)
+
+                      // Now wait 1 full second for the iOS daemon to process the leaves, then join safely.
+                      DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                          // Ensure the user hasn't switched to a third group during the delay
+                          if self.pendingJoinChannelUUID == newUUID {
+                              manager.requestJoinChannel(channelUUID: newUUID, descriptor: descriptor)
+                              print("📻 Native PTT Framework Joined Channel: \(newUUID)")
+                          }
+                      }
+                  }
+              }
+          }
+          result(nil)
         } else {
           result(FlutterMethodNotImplemented)
         }
@@ -810,11 +843,15 @@ extension NativePTTPlayer: AVAudioPlayerDelegate {
       // ✅ FIX: Do NOT call setCategory here — that resets the whole AVAudioSession
       // and can interfere with the Flutter-managed session on iPhone 12 Pro.
       // Instead, just override the output port. This is a lightweight, non-destructive call.
-      try session.setActive(true)
-      try session.overrideOutputAudioPort(.speaker)
-      print("🔊 Speaker output overridden (lightweight, session category preserved)")
+      // Only .playAndRecord category supports this override. If it fails, we silently ignore.
+      if session.category == .playAndRecord {
+        try session.setActive(true)
+        try session.overrideOutputAudioPort(.speaker)
+        print("🔊 Speaker output overridden (lightweight, session category preserved)")
+      }
     } catch {
-      print("❌ Failed to override speaker port: \(error)")
+      // Silently ignore harmless errors like -50 (kAudioSessionBadParam) 
+      // which happen if category is .playback, since .playback already uses the speaker.
     }
   }
 
@@ -1019,11 +1056,7 @@ extension AppDelegate: PTChannelManagerDelegate, PTChannelRestorationDelegate {
     }
     
     func channelManager(_ channelManager: PTChannelManager, didLeaveChannel channelUUID: UUID, reason: PTChannelLeaveReason) {
-        print("🎙️ Left PTT Channel. Rejoining silently to stay ready for next push in 2 seconds...")
-        let descriptor = PTChannelDescriptor(name: "Walkie-Talkie", image: nil)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
-            channelManager.requestJoinChannel(channelUUID: channelUUID, descriptor: descriptor)
-        }
+        print("🎙️ Left PTT Channel: \(channelUUID)")
     }
     
     func channelManager(_ channelManager: PTChannelManager, channelUUID: UUID, didBeginTransmittingFrom source: PTChannelTransmitRequestSource) {

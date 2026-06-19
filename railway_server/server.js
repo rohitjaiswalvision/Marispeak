@@ -32,7 +32,7 @@ function initAPNs() {
       },
       // ✅ TRUE for TestFlight and App Store (production APNs tokens)
       // Set to FALSE only when testing directly via Xcode USB cable (sandbox tokens)
-      production: true,
+      production: false,
     };
 
     apnProvider = new apn.Provider(options);
@@ -46,13 +46,13 @@ const crypto = require('crypto');
 
 function makeChannelUUID(groupId) {
   const md5 = crypto.createHash('md5').update(groupId || "").digest('hex');
-  return `${md5.substring(0,8)}-${md5.substring(8,12)}-${md5.substring(12,16)}-${md5.substring(16,20)}-${md5.substring(20,32)}`.toUpperCase();
+  return `${md5.substring(0, 8)}-${md5.substring(8, 12)}-${md5.substring(12, 16)}-${md5.substring(16, 20)}-${md5.substring(20, 32)}`.toUpperCase();
 }
 
-async function sendVoIPPush(deviceToken, senderName, groupId, senderId) {
+async function sendVoIPPush(deviceToken, senderName, groupId, senderId, providedChannelUUID) {
   if (!apnProvider || !deviceToken) return;
 
-  const channelUUID = makeChannelUUID(groupId);
+  const channelUUID = providedChannelUUID || makeChannelUUID(groupId);
 
   const note = new apn.Notification();
   note.expiry = 0;        // ✅ Deliver immediately
@@ -192,7 +192,7 @@ wss.on("connection", (ws) => {
             // Lowered rate limit to 2 seconds to allow back-to-back testing without dropping pushes
             if (now - lastPush > 2000) {
               client.lastVoipPushAt = now;
-              await sendVoIPPush(client.voipToken, senderName, targetGroupId, userId);
+              await sendVoIPPush(client.voipToken, senderName, targetGroupId, userId, msg.channelUUID);
             } else {
               console.log(`📦 Queued audio for ${uid} (VoIP push already sent)`);
             }

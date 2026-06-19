@@ -62,6 +62,13 @@ Widget build(BuildContext context) {
       ? groupId ?? '' // fallback to empty string if groupId is null
       : user?.userId ?? ''; // fallback to empty string if user is null
 
+  final String pttChannelId = isGroup
+      ? userOrGroupId
+      : WebSocketPTTController.sharedChannelId(
+          myid ?? '',
+          user?.userId ?? '',
+        );
+
   print('group or user id $userOrGroupId');
 
   Get.put(BlockController(user?.userId));
@@ -189,7 +196,7 @@ Widget build(BuildContext context) {
                                 }
 
                                    WebSocketPTTController()
-                                      .joinGroup(userOrGroupId);
+                                      .joinGroup(pttChannelId);
                                   await WebSocketPTTController().startRecording();
                                   // await AgoraController().toggleMic(false);
                                   // await AgoraController()
@@ -222,9 +229,7 @@ Widget build(BuildContext context) {
 
                                   await WebSocketPTTController().stopRecording();
                                   await WebSocketPTTController().sendAudio();
-                                  
-                                   WebSocketPTTController()
-                                      .joinGroup(myid.toString());
+
                                   // await AgoraController().toggleMic(true);
                                   // await AgoraController()
                                   //     .engine!
@@ -519,6 +524,10 @@ class _PushToTalkMicButtonState extends State<PushToTalkMicButton> {
       onPointerUp: (_) async {
         _zoomOut();
         widget.onPointerUp();
+      },
+      onPointerCancel: (_) async {
+        _zoomOut();
+        widget.onPointerUp(); // Cancel should trigger the same stop logic as up
       },
       child: Center(
         child: AnimatedScale(

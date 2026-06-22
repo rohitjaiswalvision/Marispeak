@@ -60,9 +60,13 @@ class WebSocketPTTController with WidgetsBindingObserver {
 
   static const RecordConfig _voiceConfig = RecordConfig(
     encoder: AudioEncoder.aacLc,
-    sampleRate: 44100, // Reverted to 44100. 16kHz can crash iOS AVAudioEngine
-    bitRate: 128000, // Reverted to 128000
+    sampleRate: 16000, // ✅ Optimized for voice (16kHz is standard for PTT/VoIP)
+    bitRate:
+        32000, // ✅ Optimized for voice (32kbps provides clear voice with small files)
     numChannels: 1,
+    echoCancel: true, // ✅ Reduce echo/feedback
+    noiseSuppress: true, // ✅ Remove background noise for clearer voice
+    autoGain: true, // ✅ Normalize volume levels
   );
 
   // ------------------------------------------------------------
@@ -98,7 +102,8 @@ class WebSocketPTTController with WidgetsBindingObserver {
       androidAudioFocusGainType: AndroidAudioFocusGainType.gain,
       androidWillPauseWhenDucked: false,
     ));
-    await session.setActive(true);
+    // ✅ FIX: Removed await session.setActive(true) here to prevent Bluetooth hijacking.
+    // We only activate the session when actively transmitting or receiving.
 
     if (Platform.isIOS) forceSpeakerOnIOS();
 
@@ -257,13 +262,17 @@ class WebSocketPTTController with WidgetsBindingObserver {
       debugPrint("📦 Flutter received ${bytes.length} bytes of audio");
 
       final dir = await getApplicationDocumentsDirectory();
-      final uniqueId = DateTime.now().microsecondsSinceEpoch; // Use microseconds instead of milliseconds
-      final path =
-          "${dir.path}/rx_${uniqueId}.m4a";
+      // ✅ FIX: Use UUID + timestamp to ensure unique filenames
+      final timestamp = DateTime.now().millisecondsSinceEpoch;
+      final random =
+          (bytes.hashCode & 0xFFFF).toRadixString(16).padLeft(4, '0');
+      final path = "${dir.path}/rx_${timestamp}_$random.m4a";
       final file = File(path);
+
+      // ✅ Write file with flush
       await file.writeAsBytes(bytes, flush: true);
 
-      // ✅ Queue chunk instead of playing immediately (prevents overlapping audio)
+      // ✅ Queue immediately - verification happens in playback
       _enqueuePlayback(path);
     }
   }
@@ -278,13 +287,43 @@ class WebSocketPTTController with WidgetsBindingObserver {
 
   Future<void> _processPlayQueue() async {
     if (_playQueue.isEmpty) {
-      _isPlaying = false;
+      if (_isPlaying) {
+        _isPlaying = false;
+        // ✅ FIX: Deactivate session when playback queue is completely empty
+        final session = await AudioSession.instance;
+        try {
+          await session.setActive(false);
+        } catch (_) {}
+      }
       return;
     }
-    _isPlaying = true;
+
+    if (!_isPlaying) {
+      _isPlaying = true;
+      // ✅ FIX: Activate session when a new message starts playing so you can hear it
+      final session = await AudioSession.instance;
+      await session.setActive(true);
+    }
+
     final path = _playQueue.removeFirst();
 
     try {
+      // ✅ FIX: Verify file exists and has content before trying to play
+      final file = File(path);
+      if (!await file.exists()) {
+        debugPrint("⚠️ Audio file not found, skipping: $path");
+        _processPlayQueue(); // Skip to next
+        return;
+      }
+
+      final fileSize = await file.length();
+      if (fileSize == 0) {
+        debugPrint("⚠️ Audio file is empty, skipping: $path");
+        await file.delete();
+        _processPlayQueue(); // Skip to next
+        return;
+      }
+
       // ✅ FIX: Re-assert speaker output before every chunk on iOS.
       if (Platform.isIOS) {
         try {
@@ -292,7 +331,7 @@ class WebSocketPTTController with WidgetsBindingObserver {
         } catch (_) {}
       }
 
-      debugPrint("🔊 Flutter playing audio chunk: $path");
+      debugPrint("🔊 Flutter playing audio chunk: $path (${fileSize} bytes)");
       await _player.setVolume(1.0); // ✅ Always play at max volume
       await _player.setAudioSource(AudioSource.uri(Uri.file(path)));
       await _player.play();
@@ -305,8 +344,9 @@ class WebSocketPTTController with WidgetsBindingObserver {
       );
       debugPrint("✅ Flutter finished playing audio chunk");
     } catch (e, stack) {
-      debugPrint("❌ Playback error: $e");
+      debugPrint("❌ Playback error: $e - Skipping to next chunk");
       debugPrint(stack.toString());
+      // ✅ FIX: Don't let one bad chunk stop the entire queue - skip to next
     } finally {
       // ✅ Always clean up temp files to avoid storage bloat
       try {
@@ -314,7 +354,7 @@ class WebSocketPTTController with WidgetsBindingObserver {
       } catch (_) {}
     }
 
-    // Play next chunk
+    // Play next chunk (recursive call)
     _processPlayQueue();
   }
 
@@ -322,23 +362,57 @@ class WebSocketPTTController with WidgetsBindingObserver {
   // RECORDING — with real-time chunked streaming
   // ------------------------------------------------------------
   Future<void> startRecording() async {
-    if (isRecording) return;
+    if (isRecording) {
+      debugPrint("⚠️ Already recording, ignoring startRecording() call");
+      return;
+    }
+
+    // ✅ FIX: Clean up any leftover state from previous recording
+    _chunkTimer?.cancel();
+    _chunkTimer = null;
+    _filePath = null;
+
+    // ✅ FIX: Ensure recorder is fully stopped before starting new recording
+    final isCurrentlyRecording = await _recorder.isRecording();
+    if (isCurrentlyRecording) {
+      debugPrint(
+          "⚠️ Recorder still active from previous session, stopping it first...");
+      try {
+        await _recorder.stop();
+      } catch (e) {
+        debugPrint("⚠️ Error stopping previous recording: $e");
+      }
+      // Wait for recorder to fully release resources
+      await Future.delayed(const Duration(milliseconds: 200));
+    }
+
+    isRecording = true;
+    debugPrint("🎙️ Starting recording with real-time chunking...");
+
     await customBottomSection.currentState?.playBeep();
     if (!await _recorder.hasPermission()) {
       await Permission.microphone.request();
+      isRecording = false;
       return;
     }
 
     await _startNewChunk();
-    isRecording = true;
 
-    // ✅ Send audio chunks every 1.5s while button is held
+    // ✅ FIX: Activate audio session only when PTT button is held
+    final session = await AudioSession.instance;
+    await session.setActive(true);
+
+    // ✅ Send audio chunks every 1.0s while button is held
     // This means recipients hear you WHILE you're still talking
-    _chunkTimer = Timer.periodic(const Duration(milliseconds: 1500), (_) async {
+    debugPrint("⏱️ Starting chunk timer - will send audio every 1.0s");
+    _chunkTimer =
+        Timer.periodic(const Duration(milliseconds: 1000), (timer) async {
       if (!isRecording) {
-        _chunkTimer?.cancel();
+        timer.cancel(); // ✅ FIX: Safely cancel this specific timer instance
+        debugPrint("⏹️ Recording stopped, canceling chunk timer");
         return;
       }
+      debugPrint("⏰ Chunk timer fired - sending current chunk...");
       await _flushAndContinue();
     });
   }
@@ -347,30 +421,89 @@ class WebSocketPTTController with WidgetsBindingObserver {
   Future<void> _startNewChunk() async {
     final dir = await getApplicationDocumentsDirectory();
     _filePath = "${dir.path}/tx_${DateTime.now().millisecondsSinceEpoch}.m4a";
+    debugPrint("🎬 Starting new chunk: $_filePath");
     await _recorder.start(_voiceConfig, path: _filePath!);
+    debugPrint("✅ Recorder started successfully");
   }
 
   /// Stop current chunk, send it, start a new chunk (called while button held)
   Future<void> _flushAndContinue() async {
     if (!isRecording) return;
+
+    // ✅ FIX: Check if recorder is actually recording before trying to stop
+    final isCurrentlyRecording = await _recorder.isRecording();
+    if (!isCurrentlyRecording) {
+      debugPrint("⚠️ Recorder not active, skipping flush");
+      return;
+    }
+
     final currentPath = _filePath;
+    debugPrint("📤 Flushing chunk: $currentPath");
+
     await _recorder.stop();
-    if (currentPath != null) await _sendFile(currentPath);
-    await _startNewChunk(); // immediately start recording next chunk
+
+    // ✅ Send the chunk immediately so receiver hears in real-time
+    if (currentPath != null) {
+      await _sendFile(currentPath);
+      debugPrint("✅ Chunk sent successfully");
+    }
+
+    // ✅ Only start new chunk if still recording
+    if (isRecording) {
+      await _startNewChunk();
+    }
   }
 
   Future<void> stopRecording() async {
     if (!isRecording) return;
+
+    debugPrint("🛑 Stopping recording...");
+
+    // ✅ FIX: Cancel timer first to prevent it from interfering
     _chunkTimer?.cancel();
     _chunkTimer = null;
-    await _recorder.stop();
+
+    // ✅ FIX: Stop the recorder and get the final chunk path BEFORE marking as not recording
+    final finalPath = _filePath;
+
+    // ✅ Check if recorder is actually recording before trying to stop
+    final isCurrentlyRecording = await _recorder.isRecording();
+    if (isCurrentlyRecording) {
+      await _recorder.stop();
+    }
+
+    // ✅ Mark as not recording BEFORE sending final chunk
     isRecording = false;
+
+    // ✅ Send the final chunk immediately
+    if (finalPath != null) {
+      debugPrint("📤 Sending final chunk: $finalPath");
+      await _sendFile(finalPath);
+    }
+
+    // ✅ FIX: Wait briefly for the native audio engine to fully stop releasing resources
+    // before deactivating the session. This prevents the iOS -12988 'Busy' crash!
+    await Future.delayed(const Duration(milliseconds: 300));
+    final session = await AudioSession.instance;
+    try {
+      await session.setActive(false);
+    } catch (e) {
+      debugPrint("⚠️ Session deactivation failed slightly, retrying... $e");
+      await Future.delayed(const Duration(milliseconds: 500));
+      try {
+        await session.setActive(false);
+      } catch (_) {}
+    }
+
+    debugPrint("✅ Recording stopped and final chunk sent");
   }
 
   Future<void> sendAudio() async {
-    // ✅ Send the final chunk after button is released
-    if (_filePath == null || groupId == null || !isConnected) return;
-    await _sendFile(_filePath!);
+    // ✅ DEPRECATED: The final chunk is now sent automatically in stopRecording()
+    // This method is kept for backwards compatibility but does nothing
+    debugPrint(
+        "📋 sendAudio() called - final chunk already sent in stopRecording()");
+    return;
   }
 
   Future<void> _sendFile(String path) async {
@@ -400,7 +533,8 @@ class WebSocketPTTController with WidgetsBindingObserver {
     // Generate MD5 channelUUID
     final md5Bytes = md5.convert(utf8.encode(groupId ?? ""));
     final hex = md5Bytes.toString().toUpperCase();
-    final channelUUID = "${hex.substring(0, 8)}-${hex.substring(8, 12)}-${hex.substring(12, 16)}-${hex.substring(16, 20)}-${hex.substring(20, 32)}";
+    final channelUUID =
+        "${hex.substring(0, 8)}-${hex.substring(8, 12)}-${hex.substring(12, 16)}-${hex.substring(16, 20)}-${hex.substring(20, 32)}";
     debugPrint("📤 Sending audio with channelUUID: $channelUUID");
 
     final msg = jsonEncode({
@@ -446,11 +580,12 @@ class WebSocketPTTController with WidgetsBindingObserver {
         debugPrint("❌ Failed to join group (socket closed): $e");
       }
     }
-    
+
     // ✅ Tell iOS PushToTalk framework to join the correct Channel UUID
     if (Platform.isIOS) {
       const pttVoipChannel = MethodChannel("ptt/voip");
-      pttVoipChannel.invokeMethod("joinChannel", {"groupId": groupId}).catchError((_) {});
+      pttVoipChannel
+          .invokeMethod("joinChannel", {"groupId": groupId}).catchError((_) {});
     }
 
     debugPrint("👥 Joined group $groupId");

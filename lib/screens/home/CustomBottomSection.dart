@@ -455,11 +455,14 @@ class _CustomBottomSectionState extends State<CustomBottomSection>
   Future<void> startSession() async {
     final session = await AudioSession.instance;
 
-    await session.configure(const AudioSessionConfiguration(
+    await session.configure(AudioSessionConfiguration(
         avAudioSessionCategory: AVAudioSessionCategory.playAndRecord,
         avAudioSessionMode: AVAudioSessionMode.voiceChat,
         avAudioSessionCategoryOptions:
-            AVAudioSessionCategoryOptions.defaultToSpeaker));
+            AVAudioSessionCategoryOptions.defaultToSpeaker |
+                AVAudioSessionCategoryOptions.duckOthers,
+        androidAudioFocusGainType:
+            AndroidAudioFocusGainType.gainTransientMayDuck));
     await session.setActive(true);
   }
 
@@ -1541,6 +1544,10 @@ class _CustomBottomSectionState extends State<CustomBottomSection>
                     // ❌ DON'T switch back to own ID - causes group mismatch!
                     // WebSocketPTTPlayer().joinGroup(currentUser.userId);
                   } else {
+                    // ✅ FIX: Ensure we stop recording even if they let go too early!
+                    // Otherwise the microphone stays open forever broadcasting silence/noise!
+                    await WebSocketPTTController().stopRecording();
+
                     Get.snackbar(
                       "PTT Error!",
                       "Try to hold on a bit longer!",

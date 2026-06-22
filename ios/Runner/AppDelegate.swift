@@ -158,7 +158,7 @@ class NativePTTPlayer: NSObject, URLSessionWebSocketDelegate {
         if audioSession == nil {
             let session = AVAudioSession.sharedInstance()
             do {
-                try session.setCategory(.playAndRecord, mode: .default, options: [.mixWithOthers, .defaultToSpeaker, .allowBluetooth])
+                try session.setCategory(.playAndRecord, mode: .default, options: [.duckOthers, .defaultToSpeaker, .allowBluetooth])
                 try session.setActive(true)
                 try session.overrideOutputAudioPort(.speaker)
                 print("🔊 NativePTTPlayer: Local audio session active — full-volume speaker output")
@@ -166,7 +166,14 @@ class NativePTTPlayer: NSObject, URLSessionWebSocketDelegate {
                 print("❌ NativePTTPlayer: Failed to configure local speaker - \(error)")
             }
         } else {
-            print("🔊 NativePTTPlayer: PushToTalk audio session active — relying on system routing")
+            print("🔊 NativePTTPlayer: PushToTalk audio session active")
+            // ✅ FIX: Force iOS to lower the volume of Spotify/Apple Music while PTT is playing!
+            do {
+                try AVAudioSession.sharedInstance().setCategory(.playAndRecord, mode: .voiceChat, options: [.duckOthers, .allowBluetooth])
+                print("🔊 Ducked background music successfully")
+            } catch {
+                print("⚠️ Failed to duck background music: \(error)")
+            }
         }
 
         processQueue() // Start playing any queued chunks!
@@ -204,7 +211,19 @@ class NativePTTPlayer: NSObject, URLSessionWebSocketDelegate {
         isPlaying = true
         
         let data = audioQueue.removeFirst()
-        playAudio(data: data)
+        
+        // ✅ FIX: Hardware Amplifier Warmup
+        // If the audio player was completely stopped, the iOS hardware amplifier takes ~500ms to physically turn on.
+        // If we play immediately, the first half-second of audio is swallowed (which ruins short 1-second messages).
+        // We delay the very FIRST chunk by 500ms. Subsequent chunks will play instantly because the amp is already warm.
+        if audioPlayer == nil {
+            print("⏳ Waiting 500ms for hardware amplifier to warm up before playing first chunk...")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                self?.playAudio(data: data)
+            }
+        } else {
+            playAudio(data: data)
+        }
     }
 
     private func playAudio(data: Data) {
@@ -415,13 +434,13 @@ extension NativePTTPlayer: AVAudioPlayerDelegate {
     func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
         isPlaying = false
         if audioQueue.isEmpty {
-            // ✅ Wait 3.5 seconds before ending the transaction. 
-            // Because Android streams in 1.5s chunks, we must not close the connection 
-            // between chunks or else the voice will cut off mid-sentence!
-            print("⏱️ Audio queue empty, waiting 3.5s before ending session...")
+            // ✅ FIX: Increased from 3.5s to 8.0s
+            // Because Android streams in 1.5s chunks, network jitter could delay the next chunk by 3 or 4 seconds.
+            // If we close the session too early, the message gets cut mid-sentence!
+            print("⏱️ Audio queue empty, waiting 8.0s before ending session...")
             DispatchQueue.main.async {
                 self.endTransactionTimer?.invalidate()
-                self.endTransactionTimer = Timer.scheduledTimer(withTimeInterval: 3.5, repeats: false) { _ in
+                self.endTransactionTimer = Timer.scheduledTimer(withTimeInterval: 8.0, repeats: false) { _ in
                     print("⏰ Timer expired, posting PTTAudioFinished notification")
                     NotificationCenter.default.post(name: NSNotification.Name("PTTAudioFinished"), object: nil)
                 }
@@ -491,27 +510,38 @@ extension NativePTTPlayer: AVAudioPlayerDelegate {
     config.supportedHandleTypes = [.generic]
     callProvider = CXProvider(configuration: config)
     callProvider?.setDelegate(self, queue: nil)
-
-    // ✅ Initialize Push To Talk Framework (iOS 16+)
-    if #available(iOS 16.0, *) {
-        // ✅ Listen for when the background audio finishes playing
-        NotificationCenter.default.addObserver(forName: NSNotification.Name("PTTAudioFinished"), object: nil, queue: .main) { [weak self] _ in
-            guard let self = self else { return }
+    // ✅ Listen for when the background audio finishes playing (Globally)
+    NotificationCenter.default.addObserver(forName: NSNotification.Name("PTTAudioFinished"), object: nil, queue: .main) { [weak self] _ in
+        guard let self = self else { return }
+        
+        if #available(iOS 16.0, *) {
             // End PushToTalk remote participant
             if let manager = self.channelManager as? PTChannelManager, let activeUUID = manager.activeChannelUUID {
                 print("🛑 Ending PTT Active Remote Participant")
                 manager.setActiveRemoteParticipant(nil, channelUUID: activeUUID, completionHandler: nil)
             }
-            // ✅ DON'T auto-end CallKit call — let user dismiss or use talk button to reply
-            // Only end it if no action is taken within 45 seconds
-            DispatchQueue.main.asyncAfter(deadline: .now() + 45.0) { [weak self] in
-                guard let self = self, let uuid = self.activeCallUUID else { return }
-                self.endPTTCallKitCall(uuid: uuid)
-            }
-            // 🔄 Reset the killed session flag so next fresh kill shows the call screen again
-            self.isPTTKilledSessionActive = false
-            print("🔄 PTT killed session ended — next kill will show call screen again")
         }
+        
+        // ✅ End CallKit call IMMEDIATELY when audio finishes, no more arbitrary delays
+        if let uuid = self.activeCallUUID {
+            self.endPTTCallKitCall(uuid: uuid)
+        }
+        
+        // 🔄 Reset the killed session flag so next fresh kill shows the call screen again
+        self.isPTTKilledSessionActive = false
+        print("🔄 PTT killed session ended — next kill will show call screen again")
+        
+        // ✅ RELEASE AUDIO SESSION TO BLUETOOTH
+        do {
+            try AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+            print("🎧 Audio session natively deactivated - Music/Bluetooth resumed")
+        } catch {
+            print("⚠️ Failed to deactivate audio session natively: \\(error)")
+        }
+    }
+
+    // ✅ Initialize Push To Talk Framework (iOS 16+)
+    if #available(iOS 16.0, *) {
 
         PTChannelManager.channelManager(delegate: self, restorationDelegate: self) { manager, error in
             if let error = error {
@@ -655,20 +685,6 @@ extension NativePTTPlayer: AVAudioPlayerDelegate {
         print("❌ CallKit report error: \(error)")
       } else {
         print("✅ CallKit call reported")
-        
-        // 🚨 QUICK HACK: Instantly "hang up" the CallKit call after 10 seconds 
-        // This gives us enough background execution time to download and play the chunk!
-        DispatchQueue.main.asyncAfter(deadline: .now() + 10.0) {
-            let endCallAction = CXEndCallAction(call: uuid)
-            let transaction = CXTransaction(action: endCallAction)
-            self.callController.request(transaction, completion: { error in
-                if let error = error {
-                    print("⚠️ Failed to auto-end call: \(error)")
-                } else {
-                    print("🤫 Auto-ended CallKit to hide ringing UI")
-                }
-            })
-        }
       }
       completion()
     }

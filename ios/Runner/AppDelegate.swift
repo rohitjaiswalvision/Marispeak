@@ -995,12 +995,8 @@ extension AppDelegate: PTChannelManagerDelegate, PTChannelRestorationDelegate {
         UserDefaults.standard.set(token, forKey: "voip_token")
         sendVoIPTokenToFlutter(token)
         
-        // 🚨 DEBUG: Show a local notification so we know the app woke up but dropped the audio!
-        let content = UNMutableNotificationContent()
-        content.title = "App Woke Up (Token Only)"
-        content.body = "Received PushToTalk token update in background. Audio blocked."
-        let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
-        UNUserNotificationCenter.current().add(request)
+        // ✅ Token refresh is normal iOS behavior - no notification needed
+        print("✅ VoIP token refreshed and stored successfully")
     }
     
     func incomingPushResult(channelManager: PTChannelManager, channelUUID: UUID, pushPayload: [String : Any]) -> PTPushResult {

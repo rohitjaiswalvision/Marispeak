@@ -288,10 +288,17 @@ class WebSocketPTTController with WidgetsBindingObserver {
       if (_isPlaying) {
         _isPlaying = false;
         // ✅ FIX: Deactivate session when playback queue is completely empty
+        // AND notify other apps (Spotify, Music, etc.) to resume
         final session = await AudioSession.instance;
         try {
-          await session.setActive(false);
-        } catch (_) {}
+          await session.setActive(false,
+              avAudioSessionSetActiveOptions:
+                  AVAudioSessionSetActiveOptions.notifyOthersOnDeactivation);
+          debugPrint(
+              "✅ Playback session deactivated - background music will resume");
+        } catch (e) {
+          debugPrint("⚠️ Session deactivation error: $e");
+        }
       }
       return;
     }

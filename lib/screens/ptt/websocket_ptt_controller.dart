@@ -80,13 +80,13 @@ class WebSocketPTTController with WidgetsBindingObserver {
     final session = await AudioSession.instance;
     // ✅ FIX: Do NOT use AudioSessionConfiguration.speech() — it sets .voiceChat mode
     // which enables AGC + noise suppression and routes output to the EARPIECE on iPhone 12 Pro.
-    // Use .playAndRecord with .defaultToSpeaker so audio always comes from the loud speaker.
+    // Use .playAndRecord WITHOUT .defaultToSpeaker so audio routes to earbuds when connected.
     await session.configure(AudioSessionConfiguration(
       avAudioSessionCategory: AVAudioSessionCategory.playAndRecord,
-      // ✅ Use | operator to combine bitmask options (NOT named constructor params)
+      // ✅ FIX: Removed .defaultToSpeaker so earbuds/headphones work!
+      // iOS will automatically route to: earbuds > Bluetooth > speaker
       avAudioSessionCategoryOptions:
-          AVAudioSessionCategoryOptions.defaultToSpeaker |
-              AVAudioSessionCategoryOptions.mixWithOthers |
+          AVAudioSessionCategoryOptions.mixWithOthers |
               AVAudioSessionCategoryOptions.allowBluetooth,
       avAudioSessionMode:
           AVAudioSessionMode.defaultMode, // ✅ correct enum value
@@ -104,8 +104,6 @@ class WebSocketPTTController with WidgetsBindingObserver {
     ));
     // ✅ FIX: Removed await session.setActive(true) here to prevent Bluetooth hijacking.
     // We only activate the session when actively transmitting or receiving.
-
-    if (Platform.isIOS) forceSpeakerOnIOS();
 
     // ✅ FIX: When iOS issues a refreshed PTT token, send it to the server
     // immediately so the server always has the latest token for push delivery.
@@ -324,14 +322,7 @@ class WebSocketPTTController with WidgetsBindingObserver {
         return;
       }
 
-      // ✅ FIX: Re-assert speaker output before every chunk on iOS.
-      if (Platform.isIOS) {
-        try {
-          await platform.invokeMethod("forceSpeaker");
-        } catch (_) {}
-      }
-
-      debugPrint("🔊 Flutter playing audio chunk: $path (${fileSize} bytes)");
+      debugPrint("🔊 Flutter playing audio chunk: $path ($fileSize bytes)");
       await _player.setVolume(1.0); // ✅ Always play at max volume
       await _player.setAudioSource(AudioSource.uri(Uri.file(path)));
       await _player.play();
@@ -486,12 +477,19 @@ class WebSocketPTTController with WidgetsBindingObserver {
     await Future.delayed(const Duration(milliseconds: 300));
     final session = await AudioSession.instance;
     try {
-      await session.setActive(false);
+      // ✅ FIX: Add .notifyOthersOnDeactivation to resume background music (Spotify, Apple Music, etc.)
+      await session.setActive(false,
+          avAudioSessionSetActiveOptions:
+              AVAudioSessionSetActiveOptions.notifyOthersOnDeactivation);
+      debugPrint(
+          "✅ Session deactivated - background music will resume automatically");
     } catch (e) {
       debugPrint("⚠️ Session deactivation failed slightly, retrying... $e");
       await Future.delayed(const Duration(milliseconds: 500));
       try {
-        await session.setActive(false);
+        await session.setActive(false,
+            avAudioSessionSetActiveOptions:
+                AVAudioSessionSetActiveOptions.notifyOthersOnDeactivation);
       } catch (_) {}
     }
 

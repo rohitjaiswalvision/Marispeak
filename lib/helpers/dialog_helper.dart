@@ -53,17 +53,22 @@ abstract class DialogHelper {
     }
 
     try {
-      Get.snackbar(
-        title,
-        message,
-        colorText: Colors.white,
-        icon: const Icon(IconlyLight.dangerCircle, color: Colors.white),
-        backgroundColor: bgColor,
-        snackPosition: position,
-        borderRadius: defaultRadius,
-        duration: Duration(seconds: duration),
-        margin: const EdgeInsets.all(defaultMargin),
-      );
+      // ✅ FIX: Check if Overlay is available before showing snackbar
+      if (Get.context != null && Get.overlayContext != null) {
+        Get.snackbar(
+          title,
+          message,
+          colorText: Colors.white,
+          icon: const Icon(IconlyLight.dangerCircle, color: Colors.white),
+          backgroundColor: bgColor,
+          snackPosition: position,
+          borderRadius: defaultRadius,
+          duration: Duration(seconds: duration),
+          margin: const EdgeInsets.all(defaultMargin),
+        );
+      } else {
+        debugPrint('Skipping snackbar - Overlay not ready yet');
+      }
     } catch (e) {
       debugPrint('Failed to show snackbar (Overlay likely missing): $e');
     }

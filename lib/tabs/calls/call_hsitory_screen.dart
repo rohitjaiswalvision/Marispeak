@@ -40,26 +40,37 @@ class _CallHistoryScreenState extends State<CallHistoryScreen> {
       });
       await prefs.remove('fromHome');
     }
-    if(!fromHome){
+    if (!fromHome) {
       setState(() {
         showBackButton = false;
-         print("Not home, $fromHome");
-    });
+        print("Not home, $fromHome");
+      });
     }
   }
-Widget _buildLeading() {
-  if (showBackButton) {
-    return IconButton(
-      icon: const Icon(Icons.arrow_back),
-      onPressed: () {
-        setState(() => showBackButton = false);
-        Get.back();
-      },
-    );
-  } else {
-    return const SizedBox(); // return empty widget
+
+  Widget _buildLeading() {
+    if (showBackButton) {
+      return IconButton(
+        icon: const Icon(Icons.arrow_back),
+        onPressed: () {Navigator.of(context).pop();},
+        // onPressed: () {
+        //   Get.back();
+        //   // Get.toNamed(AppRoutes.mapHome);
+        //   // setState(() => showBackButton = false);
+        //   // // ✅ FIX: Safely navigate back even if snackbar is broken
+        //   // try {
+        //   //   Get.back();
+        //   // } catch (e) {
+        //   //   // If Get.back() fails due to broken snackbar, use Navigator directly
+        //   //   debugPrint('Get.back() failed: $e');
+        //   //   Navigator.of(context).pop();
+        //   // }
+        // },
+      );
+    } else {
+      return const SizedBox(); // return empty widget
+    }
   }
-}
 
   @override
   Widget build(BuildContext context) {
@@ -72,23 +83,21 @@ Widget _buildLeading() {
         Future.microtask(() => Get.back());
         return false; // prevent default pop; we're handling it
       },
-      
       child: Scaffold(
-     appBar: showBackButton
-    ? AppBar(
-        leading: _buildLeading(),
-        title: Text(
-          'Call History'.tr,
-          style: const TextStyle(
-            color: Colors.black,
-            fontWeight: FontWeight.bold,
-          ),
-        ),
-        backgroundColor: Theme.of(context).scaffoldBackgroundColor,
-        elevation: 0,
-      )
-    : null,
-
+        appBar: showBackButton
+            ? AppBar(
+                leading: _buildLeading(),
+                title: Text(
+                  'Call History'.tr,
+                  style: const TextStyle(
+                    color: Colors.black,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                backgroundColor: Theme.of(context).scaffoldBackgroundColor,
+                elevation: 0,
+              )
+            : null,
         body: Obx(() {
           if (controller.isLoading.value) {
             return const LoadingIndicator();

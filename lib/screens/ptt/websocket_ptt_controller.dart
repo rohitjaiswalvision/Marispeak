@@ -514,19 +514,27 @@ class WebSocketPTTController with WidgetsBindingObserver {
   Future<void> _sendFile(String path) async {
     if (groupId == null) return;
 
-    // ✅ FIX: Wait up to 3 seconds for WebSocket to connect before dropping the chunk.
+    // ✅ FIX: Wait up to 5 seconds for WebSocket to connect before dropping the chunk.
     // This fixes the "first message doesn't send" bug if the user presses the button
     // immediately after opening the app before the socket finishes connecting.
     if (!isConnected || _channel == null) {
       debugPrint("⏳ Waiting for WebSocket to connect before sending audio...");
-      for (int i = 0; i < 15; i++) {
-        if (isConnected && _channel != null) break;
+      debugPrint(
+          "📊 Connection status: isConnected=$isConnected, channel=${_channel != null}");
+      for (int i = 0; i < 25; i++) {
+        // 5 seconds (25 × 200ms)
+        if (isConnected && _channel != null) {
+          debugPrint("✅ Connection ready after ${i * 200}ms");
+          break;
+        }
         await Future.delayed(const Duration(milliseconds: 200));
       }
     }
 
     if (!isConnected || _channel == null) {
-      debugPrint("❌ Still not connected, dropping chunk.");
+      debugPrint("❌ Still not connected after 5 seconds, dropping chunk.");
+      debugPrint(
+          "💡 TIP: Wait a few seconds after opening app before using PTT");
       return;
     }
 

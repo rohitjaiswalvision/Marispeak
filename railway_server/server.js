@@ -4,6 +4,7 @@ import WebSocket, { WebSocketServer } from "ws";
 import apn from "@parse/node-apn";
 import path from "path";
 import { fileURLToPath } from 'url';
+import crypto from 'crypto';
 
 // Setup for ES Modules __dirname
 const __filename = fileURLToPath(import.meta.url);
@@ -32,7 +33,7 @@ function initAPNs() {
       },
       // ✅ TRUE for TestFlight and App Store (production APNs tokens)
       // Set to FALSE only when testing directly via Xcode USB cable (sandbox tokens)
-      production: false,
+      production: true,
     };
 
     apnProvider = new apn.Provider(options);
@@ -42,7 +43,7 @@ function initAPNs() {
   }
 }
 
-const crypto = require('crypto');
+// crypto imported at top of file (ES Module)
 
 function makeChannelUUID(groupId) {
   const md5 = crypto.createHash('md5').update(groupId || "").digest('hex');
